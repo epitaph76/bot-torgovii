@@ -126,6 +126,7 @@ class BybitDemoRuntime:
             "action": action,
             "reason": reason,
             "decision": asdict(decision),
+            "market_snapshot": _market_snapshot(bundle, self.config),
             "active_before": active,
             "flat": flat_payload,
             "rebalance": rebalance,
@@ -136,15 +137,41 @@ class BybitDemoRuntime:
 
     def run_forever(self, *, dry_run: bool = False) -> None:
         while True:
-            wait = seconds_until_next_decision(delay_seconds=int(self.config.decision_delay_seconds))
-            time.sleep(wait)
+            target_dt = next_decision_datetime(delay_seconds=int(self.config.decision_delay_seconds))
+            self._sleep_until_decision(target_dt=target_dt, dry_run=dry_run)
             try:
                 result = self.run_once(dry_run=dry_run)
-                print(json.dumps({"decision_id": result["decision_id"], "action": result["action"], "reason": result["reason"]}, ensure_ascii=False), flush=True)
+                print(json.dumps(_decision_log_payload(result), ensure_ascii=False, default=str), flush=True)
             except Exception as exc:
                 self.state.set_reconciliation("blocked", f"runtime_error:{type(exc).__name__}", {"error": str(exc)})
-                print(json.dumps({"status": "blocked", "error": str(exc)}, ensure_ascii=False), flush=True)
+                print(json.dumps({"event": "runtime_error", "status": "blocked", "error": str(exc), "now_utc": _utcnow_iso()}, ensure_ascii=False), flush=True)
                 time.sleep(max(int(self.config.loop_sleep_seconds), 1))
+
+    def _sleep_until_decision(self, *, target_dt: datetime, dry_run: bool) -> None:
+        heartbeat = max(int(self.config.heartbeat_seconds), 1)
+        while True:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            remaining = (target_dt - now).total_seconds()
+            if remaining <= 0:
+                return
+            active = self.state.load_active_episode()
+            print(
+                json.dumps(
+                    {
+                        "event": "heartbeat",
+                        "environment": self.config.environment,
+                        "dry_run": bool(dry_run),
+                        "now_utc": now.isoformat(timespec="seconds"),
+                        "next_decision_utc": target_dt.isoformat(timespec="seconds"),
+                        "seconds_until_next_decision": int(max(remaining, 0)),
+                        "active_symbol": active.get("symbol") if active else None,
+                        "active_side": active.get("side") if active else None,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            time.sleep(min(remaining, heartbeat))
 
     def status(self) -> dict[str, Any]:
         return self.state.status()
@@ -481,13 +508,18 @@ class BybitDemoRuntime:
 
 
 def seconds_until_next_decision(*, delay_seconds: int) -> float:
+    target_dt = next_decision_datetime(delay_seconds=delay_seconds)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return max(target_dt.timestamp() - now.timestamp(), 0.0)
+
+
+def next_decision_datetime(*, delay_seconds: int) -> datetime:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     current_hour = now.replace(minute=0, second=0, microsecond=0)
     target_dt = current_hour + timedelta(seconds=int(delay_seconds))
     if now > target_dt:
         target_dt = current_hour + timedelta(hours=1, seconds=int(delay_seconds))
-    target = target_dt.timestamp()
-    return max(target - now.timestamp(), 0.0)
+    return target_dt
 
 
 def _decision_id(as_of: str, selected: Mapping[str, Any] | None, *, rebalance_only: bool) -> str:
@@ -528,6 +560,107 @@ def _position(payload: Mapping[str, Any]) -> tuple[Decimal, str, Decimal]:
         if qty != 0:
             return qty, side, avg_price
     return Decimal("0"), "", Decimal("0")
+
+
+def _market_snapshot(bundle: MarketBundle, config: BybitDemoBotConfig) -> dict[str, Any]:
+    symbols: dict[str, Any] = {}
+    for symbol in config.strategy.symbols:
+        ticker = bundle.tickers[symbol]
+        spread_pct = None
+        if ticker.bid1_price > 0 and ticker.ask1_price > 0:
+            mid = (ticker.bid1_price + ticker.ask1_price) / Decimal("2")
+            if mid > 0:
+                spread_pct = str((ticker.ask1_price - ticker.bid1_price) / mid)
+        spec = bundle.specs[symbol]
+        symbols[symbol] = {
+            "last_completed_candle": _last_completed_candle(bundle, symbol),
+            "forming_open": str(bundle.forming_open[symbol]),
+            "ticker": {
+                "last_price": str(ticker.last_price),
+                "bid1_price": str(ticker.bid1_price),
+                "ask1_price": str(ticker.ask1_price),
+                "bid_ask_spread_pct": spread_pct,
+            },
+            "instrument": {
+                "tick_size": str(spec.tick_size),
+                "qty_step": str(spec.qty_step),
+                "min_order_qty": str(spec.min_order_qty),
+                "min_notional": str(spec.min_notional),
+                "max_market_qty": str(spec.max_market_qty),
+                "max_leverage": str(spec.max_leverage),
+            },
+        }
+    return {
+        "decision_as_of": bundle.decision_as_of.isoformat(),
+        "target_timestamp": bundle.target_timestamp.isoformat(),
+        "symbols": symbols,
+    }
+
+
+def _last_completed_candle(bundle: MarketBundle, symbol: str) -> dict[str, Any] | None:
+    frame = bundle.candles.get(symbol)
+    if frame is None or frame.empty:
+        return None
+    row = frame.iloc[-1]
+    out: dict[str, Any] = {}
+    for key in ("timestamps", "end", "open", "high", "low", "close", "volume", "amount"):
+        value = row.get(key)
+        if hasattr(value, "isoformat"):
+            value = value.isoformat()
+        elif isinstance(value, float) and not math.isfinite(value):
+            value = None
+        out[key] = value
+    return out
+
+
+def _decision_log_payload(result: Mapping[str, Any]) -> dict[str, Any]:
+    decision = result.get("decision", {})
+    ranked_rows = decision.get("ranked_rows", []) if isinstance(decision, Mapping) else []
+    compact_rank = []
+    if isinstance(ranked_rows, list):
+        for row in ranked_rows:
+            if not isinstance(row, Mapping):
+                continue
+            compact_rank.append(
+                {
+                    "rank": row.get("rank"),
+                    "symbol": row.get("secid"),
+                    "side": row.get("final_side"),
+                    "entry_selected": row.get("entry_selected"),
+                    "net_pred_move_bps": row.get("net_pred_move_bps"),
+                    "vol_ratio_168": row.get("vol_ratio_168"),
+                    "execution_cost_bps": row.get("execution_cost_bps"),
+                    "estimated_spread_pct": row.get("estimated_spread_pct"),
+                    "slippage_one_way_pct": row.get("slippage_one_way_pct"),
+                    "hl_relevant_wick_ratio_168": row.get("hl_relevant_wick_ratio_168"),
+                    "hl_range_ratio_168": row.get("hl_range_ratio_168"),
+                    "flip_applied": row.get("flip_applied"),
+                    "actual_open": row.get("actual_open"),
+                    "pred_close": row.get("pred_close"),
+                    "pred_high": row.get("pred_high"),
+                    "pred_low": row.get("pred_low"),
+                }
+            )
+    return {
+        "event": "decision",
+        "now_utc": _utcnow_iso(),
+        "decision_id": result.get("decision_id"),
+        "dry_run": result.get("dry_run"),
+        "action": result.get("action"),
+        "reason": result.get("reason"),
+        "as_of": result.get("as_of"),
+        "target_timestamp": result.get("target_timestamp"),
+        "ranked": compact_rank,
+        "selected": decision.get("selected") if isinstance(decision, Mapping) else None,
+        "market_snapshot": result.get("market_snapshot"),
+        "flat": result.get("flat"),
+        "rebalance": result.get("rebalance"),
+        "orders": result.get("orders"),
+    }
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def _wallet_compact(payload: Mapping[str, Any], *, coin: str) -> list[dict[str, Any]]:

@@ -92,6 +92,7 @@ class BybitDemoBotConfig:
     public_base_url: str = DEMO_BASE_URL
     state_path: str = "data/bybit_demo/state.sqlite3"
     decision_delay_seconds: int = 20
+    heartbeat_seconds: int = 300
     loop_sleep_seconds: int = 30
     recv_window: int = 5000
     request_timeout_seconds: float = 15.0

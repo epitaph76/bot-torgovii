@@ -58,6 +58,8 @@ Continuous Demo runtime:
 .\scripts\run_bybit_demo.ps1
 ```
 
+While running, the bot prints one JSON heartbeat every `heartbeat_seconds` with the next hourly decision time. Every decision log includes ranking, costs/spread estimates, market snapshots, exchange flatness, rebalance state, and submitted order/stop responses.
+
 ## Strategy
 
 The strategy is the latest handoff baseline:
