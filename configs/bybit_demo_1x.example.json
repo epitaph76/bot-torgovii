@@ -6,7 +6,7 @@
   "decision_delay_seconds": 20,
   "heartbeat_seconds": 300,
   "loop_sleep_seconds": 30,
-  "recv_window": 5000,
+  "recv_window": 15000,
   "request_timeout_seconds": 30,
   "request_retries": 2,
   "master_account": {

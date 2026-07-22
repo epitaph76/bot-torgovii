@@ -102,6 +102,21 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNotNone(active)
             self.assertEqual(active["symbol"], "GRAMUSDT")
 
+    def test_successful_run_clears_stale_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BybitDemoBotConfig(state_path=str(Path(tmp) / "state.sqlite3"))
+            forecasts = {
+                "GRAMUSDT": ForecastRow("GRAMUSDT", 100, 180, 99, 120, 0, 0),
+                "ZECUSDT": ForecastRow("ZECUSDT", 100, 100.5, 99.5, 101, 0, 0),
+            }
+            state = BotStateStore(cfg.state_path)
+            state.set_reconciliation("blocked", "runtime_error:BybitDemoError", {"error": "timestamp drift"})
+            runtime = BybitDemoRuntime(config=cfg, market=FakeMarket(bundle()), forecaster=FakeForecaster(forecasts), state=state)
+
+            runtime.run_once(dry_run=True)
+
+            self.assertIsNone(state.reconciliation())
+
     def test_rebalance_threshold_submits_transfer_when_flat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = parse_config(

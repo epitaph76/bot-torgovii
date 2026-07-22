@@ -71,6 +71,11 @@ class BotStateStore:
                     (status, reason, _json(payload or {}), _now()),
                 )
 
+    def clear_reconciliation(self) -> None:
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("delete from reconciliation where id = 1")
+
     def reconciliation(self) -> dict[str, Any] | None:
         with closing(self._connect()) as conn:
             row = conn.execute("select status, reason, payload_json, updated_at from reconciliation where id = 1").fetchone()

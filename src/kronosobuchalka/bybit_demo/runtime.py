@@ -133,6 +133,8 @@ class BybitDemoRuntime:
             "orders": orders,
         }
         self.state.save_decision(decision_id, decision.as_of, payload)
+        if not _payload_blocks_reconciliation(payload):
+            self.state.clear_reconciliation()
         return payload
 
     def run_forever(self, *, dry_run: bool = False) -> None:
@@ -657,6 +659,11 @@ def _decision_log_payload(result: Mapping[str, Any]) -> dict[str, Any]:
         "rebalance": result.get("rebalance"),
         "orders": result.get("orders"),
     }
+
+
+def _payload_blocks_reconciliation(payload: Mapping[str, Any]) -> bool:
+    rebalance = payload.get("rebalance")
+    return isinstance(rebalance, Mapping) and rebalance.get("status") == "blocked"
 
 
 def _utcnow_iso() -> str:

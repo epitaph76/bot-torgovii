@@ -36,7 +36,7 @@ class BybitV5Client:
         *,
         credentials: BybitCredentials | None = None,
         base_url: str = DEMO_BASE_URL,
-        recv_window: int = 5000,
+        recv_window: int = 15000,
         timeout: float = 15.0,
         retries: int = 2,
         session: requests.Session | None = None,

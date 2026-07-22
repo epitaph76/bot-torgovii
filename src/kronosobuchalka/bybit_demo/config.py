@@ -94,7 +94,7 @@ class BybitDemoBotConfig:
     decision_delay_seconds: int = 20
     heartbeat_seconds: int = 300
     loop_sleep_seconds: int = 30
-    recv_window: int = 5000
+    recv_window: int = 15000
     request_timeout_seconds: float = 15.0
     request_retries: int = 2
     master_account: MasterAccountConfig = field(default_factory=MasterAccountConfig)
