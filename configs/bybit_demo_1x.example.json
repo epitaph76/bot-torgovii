@@ -1,0 +1,68 @@
+{
+  "environment": "bybit_demo",
+  "base_url": "https://api-demo.bybit.com",
+  "public_base_url": "https://api-demo.bybit.com",
+  "state_path": "data/bybit_demo/state.sqlite3",
+  "decision_delay_seconds": 20,
+  "loop_sleep_seconds": 30,
+  "recv_window": 5000,
+  "request_timeout_seconds": 30,
+  "request_retries": 2,
+  "master_account": {
+    "api_key_env": "BYBIT_DEMO_API_KEY",
+    "api_secret_env": "BYBIT_DEMO_API_SECRET",
+    "member_id": "",
+    "account_type": "UNIFIED"
+  },
+  "split": {
+    "rebalance_threshold_pp": 100.0,
+    "coin": "USDT",
+    "sleeves": [
+      {
+        "sleeve_id": "trade_1x",
+        "kind": "trade",
+        "target_weight": 1.0,
+        "leverage": 1,
+        "api_key_env": "BYBIT_DEMO_API_KEY",
+        "api_secret_env": "BYBIT_DEMO_API_SECRET",
+        "member_id": "",
+        "account_type": "UNIFIED",
+        "dry_run_equity_usdt": 1000
+      }
+    ]
+  },
+  "strategy": {
+    "symbols": ["GRAMUSDT", "ZECUSDT"],
+    "category": "linear",
+    "interval": "60",
+    "history_limit": 720,
+    "entry_vol_ratio_168_min": 1.75,
+    "entry_net_pred_move_bps_min": 150,
+    "exit_net_pred_move_bps_min": 50,
+    "exit_vol_ratio_168_min": 0.75,
+    "hl_relevant_wick_ratio_168_min": 5.0,
+    "hl_range_ratio_168_min": 2.25,
+    "stop_loss_pct": 0.05,
+    "sl_trigger_by": "LastPrice",
+    "commission_rate": 0.0005,
+    "minimum_spread_pct": 0.0002,
+    "maximum_spread_pct": 0.003,
+    "slippage_spread_multiplier": 0.5,
+    "range_fallback_fraction": 0.05,
+    "liquidity_lookback": 48,
+    "liquidity_min_periods": 12,
+    "liquidity_penalty_min": 0.5,
+    "liquidity_penalty_max": 3.0
+  },
+  "kronos": {
+    "code_dir": "kronos/model",
+    "weights_dir": "kronos/weights",
+    "model": "base",
+    "context_rows": 512,
+    "pred_len": 1,
+    "sample_count": 10,
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "device": "auto"
+  }
+}

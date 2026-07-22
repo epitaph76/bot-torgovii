@@ -1,0 +1,9 @@
+einops>=0.8
+huggingface_hub>=0.33
+numpy>=2.0
+pandas>=2.2
+requests>=2.31
+safetensors>=0.6
+torch>=2.0
+tqdm>=4.67
+

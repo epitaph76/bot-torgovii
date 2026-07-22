@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bot-torgovii"
+version = "0.1.0"
+description = "Autonomous Bybit Demo GRAM/ZEC Kronos trading bot."
+requires-python = ">=3.11"
+dependencies = [
+  "einops>=0.8",
+  "huggingface_hub>=0.33",
+  "numpy>=2.0",
+  "pandas>=2.2",
+  "requests>=2.31",
+  "safetensors>=0.6",
+  "torch>=2.0",
+  "tqdm>=4.67",
+]
+
+[project.scripts]
+bot-torgovii = "kronosobuchalka.cli:main"
+kronosobuchalka = "kronosobuchalka.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
