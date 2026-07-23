@@ -13,7 +13,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from kronosobuchalka.bybit_demo.config import BybitDemoBotConfig  # noqa: E402
+from kronosobuchalka.bybit_demo.config import BybitDemoBotConfig, parse_config  # noqa: E402
 from kronosobuchalka.bybit_demo.market import InstrumentSpec, MarketBundle, Ticker  # noqa: E402
 from kronosobuchalka.bybit_demo.strategy import (  # noqa: E402
     ForecastRow,
@@ -62,6 +62,38 @@ def spec(symbol: str, tick: str = "0.01", qty_step: str = "0.1") -> InstrumentSp
 
 
 class StrategyTests(unittest.TestCase):
+    def test_soft_filters_select_rank1_even_when_signal_is_weak(self) -> None:
+        cfg = parse_config(
+            {
+                "strategy": {
+                    "entry_vol_ratio_168_min": 0.0,
+                    "entry_net_pred_move_bps_min": -10000,
+                }
+            }
+        )
+        base = candles(price=100)
+        bundle = MarketBundle(
+            candles={"GRAMUSDT": base, "ZECUSDT": base.copy()},
+            forming_open={"GRAMUSDT": Decimal("100"), "ZECUSDT": Decimal("100")},
+            tickers={
+                "GRAMUSDT": Ticker("GRAMUSDT", Decimal("100"), Decimal("99.9"), Decimal("100.1")),
+                "ZECUSDT": Ticker("ZECUSDT", Decimal("100"), Decimal("99.9"), Decimal("100.1")),
+            },
+            specs={"GRAMUSDT": spec("GRAMUSDT"), "ZECUSDT": spec("ZECUSDT")},
+            decision_as_of=pd.Timestamp("2026-07-10 00:00:00"),
+            target_timestamp=pd.Timestamp("2026-07-10 01:00:00"),
+        )
+        forecasts = {
+            "GRAMUSDT": ForecastRow("GRAMUSDT", 100, 100.1, 99.9, 100.0, 0, 0),
+            "ZECUSDT": ForecastRow("ZECUSDT", 100, 100.1, 99.9, 100.0, 0, 0),
+        }
+
+        decision = build_strategy_decision(bundle=bundle, forecasts=forecasts, config=cfg)
+
+        self.assertEqual(decision.status, "selected")
+        self.assertIsNotNone(decision.selected)
+        self.assertTrue(decision.ranked_rows[0]["entry_selected"])
+
     def test_rank_recomputed_after_dynamic_cost(self) -> None:
         cfg = BybitDemoBotConfig()
         gram = candles(price=10)
@@ -133,12 +165,42 @@ class StrategyTests(unittest.TestCase):
         self.assertFalse(can_hold)
         self.assertEqual(reason, "rank1_side_changed")
 
+    def test_soft_hold_thresholds_allow_weak_same_signal(self) -> None:
+        cfg = parse_config(
+            {
+                "strategy": {
+                    "exit_net_pred_move_bps_min": -10000,
+                    "exit_vol_ratio_168_min": 0.0,
+                }
+            }
+        )
+        active = {"symbol": "GRAMUSDT", "side": "short", "target_timestamp": "2026-07-10T00:00:00"}
+        decision = type(
+            "D",
+            (),
+            {
+                "as_of": "2026-07-10T00:00:00",
+                "selected": {
+                    "secid": "GRAMUSDT",
+                    "final_side": "short",
+                    "net_pred_move_bps": -500.0,
+                    "vol_ratio_168": 0.0,
+                },
+            },
+        )()
+
+        can_hold, reason = active_can_hold(active=active, decision=decision, config=cfg)
+
+        self.assertTrue(can_hold, reason)
+
     def test_stop_price_and_qty(self) -> None:
         instrument = spec("GRAMUSDT", "0.0001", "0.1")
         self.assertEqual(stop_price(side="long", entry_price=Decimal("1.2345"), stop_loss_pct=0.05, spec=instrument), Decimal("1.1727"))
         self.assertEqual(stop_price(side="short", entry_price=Decimal("1.2345"), stop_loss_pct=0.05, spec=instrument), Decimal("1.2962"))
         qty = order_qty(equity=Decimal("5000"), leverage=3, price=Decimal("1.25"), spec=instrument)
         self.assertEqual(qty, Decimal("12000.0"))
+        capped = order_qty(equity=Decimal("5000"), leverage=3, price=Decimal("1.25"), spec=instrument, max_notional_usdt=Decimal("100"))
+        self.assertEqual(capped, Decimal("80.0"))
 
 
 if __name__ == "__main__":

@@ -168,10 +168,21 @@ def stop_price(*, side: str, entry_price: Decimal, stop_loss_pct: float, spec: I
     return quantize_down(raw, spec.tick_size)
 
 
-def order_qty(*, equity: Decimal, leverage: float, price: Decimal, spec: InstrumentSpec) -> Decimal:
+def order_qty(
+    *,
+    equity: Decimal,
+    leverage: float,
+    price: Decimal,
+    spec: InstrumentSpec,
+    max_notional_usdt: Decimal | float | None = None,
+) -> Decimal:
     if price <= 0:
         return Decimal("0")
     notional = equity * Decimal(str(leverage))
+    if max_notional_usdt not in (None, ""):
+        cap = Decimal(str(max_notional_usdt))
+        if cap > 0:
+            notional = min(notional, cap)
     qty = quantize_down(notional / price, spec.qty_step)
     if qty < spec.min_order_qty:
         return Decimal("0")

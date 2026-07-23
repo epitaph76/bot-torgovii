@@ -60,8 +60,13 @@ class BybitDemoRuntime:
         decision = build_strategy_decision(bundle=bundle, forecasts=forecasts, config=self.config)
         decision_id = _decision_id(decision.as_of, decision.selected, rebalance_only=rebalance_only)
         active = self.state.load_active_episode()
+        active_before = active
 
         flat, flat_payload = self._all_flat(dry_run=dry_run, active=active)
+        if active and flat and not dry_run:
+            self.state.clear_active_episode()
+            active = None
+            flat_payload["active_episode_cleared"] = "exchange_flat"
         rebalance = self._rebalance_if_needed(bundle=bundle, dry_run=dry_run, flat=flat)
 
         orders: list[dict[str, Any]] = []
@@ -72,12 +77,21 @@ class BybitDemoRuntime:
         else:
             can_hold, hold_reason = active_can_hold(active=active, decision=decision, config=self.config)
             if active and can_hold:
+                stop_orders = self._refresh_stops_for_active(
+                    decision_id=decision_id,
+                    bundle=bundle,
+                    active=active,
+                    selected=decision.selected or {},
+                    dry_run=dry_run,
+                )
+                orders.extend(stop_orders)
                 action = "hold"
                 reason = hold_reason
                 updated = dict(active)
                 updated["as_of"] = decision.as_of
                 updated["target_timestamp"] = decision.target_timestamp
                 updated["last_decision"] = decision.selected
+                updated["last_stop_refresh"] = stop_orders
                 self.state.set_active_episode(updated)
             else:
                 if active:
@@ -115,6 +129,7 @@ class BybitDemoRuntime:
                 elif action == "none":
                     action = "cash"
 
+        spread_snapshots = _spread_snapshot_rows(bundle, decision, self.config)
         payload = {
             "decision_id": decision_id,
             "dry_run": bool(dry_run),
@@ -127,12 +142,14 @@ class BybitDemoRuntime:
             "reason": reason,
             "decision": asdict(decision),
             "market_snapshot": _market_snapshot(bundle, self.config),
-            "active_before": active,
+            "active_before": active_before,
             "flat": flat_payload,
             "rebalance": rebalance,
+            "spread_snapshots": spread_snapshots,
             "orders": orders,
         }
         self.state.save_decision(decision_id, decision.as_of, payload)
+        self.state.save_spread_snapshots(spread_snapshots)
         if not _payload_blocks_reconciliation(payload):
             self.state.clear_reconciliation()
         return payload
@@ -322,6 +339,7 @@ class BybitDemoRuntime:
                     "account_type": sleeve.account_type,
                     "target_weight": float(sleeve.target_weight),
                     "leverage": float(sleeve.leverage),
+                    "max_notional_usdt": float(sleeve.max_notional_usdt),
                     "equity_usdt": str(equity),
                 }
             )
@@ -369,6 +387,62 @@ class BybitDemoRuntime:
                 src["amount"] -= amount
                 dst["amount"] -= amount
         return [transfer for transfer in transfers if Decimal(transfer["amount"]) > 0]
+
+    def _refresh_stops_for_active(
+        self,
+        *,
+        decision_id: str,
+        bundle: MarketBundle,
+        active: Mapping[str, Any],
+        selected: Mapping[str, Any],
+        dry_run: bool,
+    ) -> list[dict[str, Any]]:
+        symbol = str(active.get("symbol"))
+        final_side = str(selected.get("final_side") or active.get("side"))
+        events: list[dict[str, Any]] = []
+        for sleeve in self._trade_sleeves():
+            client = self.sleeve_clients[sleeve.sleeve_id]
+            if dry_run:
+                sleeve_payload = dict((active.get("sleeves") or {}).get(sleeve.sleeve_id) or {})
+                qty = Decimal(str(sleeve_payload.get("qty", "0")))
+                avg_price = Decimal(str(sleeve_payload.get("entry_price") or active.get("entry_price") or _entry_price(bundle, selected)))
+                pos_side = "Buy" if final_side == "long" else "Sell"
+            else:
+                qty, pos_side, avg_price = _position(client.positions(category=self.config.strategy.category, symbol=symbol))
+            if qty <= 0:
+                self.state.set_reconciliation("blocked", "hold_position_missing", {"sleeve_id": sleeve.sleeve_id, "symbol": symbol})
+                raise BybitDemoError(f"hold position missing for {sleeve.sleeve_id}:{symbol}")
+            expected_pos_side = "Buy" if final_side == "long" else "Sell"
+            if pos_side and pos_side != expected_pos_side:
+                self.state.set_reconciliation(
+                    "blocked",
+                    "hold_position_side_mismatch",
+                    {"sleeve_id": sleeve.sleeve_id, "symbol": symbol, "expected": expected_pos_side, "actual": pos_side},
+                )
+                raise BybitDemoError(f"hold position side mismatch for {sleeve.sleeve_id}:{symbol}: expected {expected_pos_side}, got {pos_side}")
+            entry = avg_price if avg_price > 0 else Decimal(str(active.get("entry_price") or _entry_price(bundle, selected)))
+            sl = stop_price(side=final_side, entry_price=entry, stop_loss_pct=float(self.config.strategy.stop_loss_pct), spec=bundle.specs[symbol])
+            response = client.set_trading_stop(
+                category=self.config.strategy.category,
+                symbol=symbol,
+                stop_loss=sl,
+                trigger_by=self.config.strategy.sl_trigger_by,
+                environment=self.config.environment,
+                dry_run=dry_run,
+            )
+            event = {
+                "sleeve_id": sleeve.sleeve_id,
+                "action": "refresh_stop",
+                "symbol": symbol,
+                "final_side": final_side,
+                "qty": str(qty),
+                "avg_price": str(avg_price),
+                "stop_loss": str(sl),
+                "response": response,
+            }
+            self.state.save_order_event(decision_id, sleeve.sleeve_id, "refresh_stop", event)
+            events.append(event)
+        return events
 
     def _close_all_sleeves(
         self,
@@ -427,9 +501,16 @@ class BybitDemoRuntime:
                 client = self.sleeve_clients[sleeve.sleeve_id]
                 leverage = min(Decimal(str(sleeve.leverage)), spec.max_leverage)
                 equity = Decimal(str(sleeve.dry_run_equity_usdt)) if dry_run else self._wallet_equity(client)
-                qty = order_qty(equity=equity, leverage=float(leverage), price=entry, spec=spec)
+                max_notional = Decimal(str(sleeve.max_notional_usdt)) if float(sleeve.max_notional_usdt) > 0 else None
+                qty = order_qty(equity=equity, leverage=float(leverage), price=entry, spec=spec, max_notional_usdt=max_notional)
                 if qty <= 0:
-                    event = {"sleeve_id": sleeve.sleeve_id, "action": "skip_open", "reason": "qty_below_minimum", "equity_usdt": str(equity)}
+                    event = {
+                        "sleeve_id": sleeve.sleeve_id,
+                        "action": "skip_open",
+                        "reason": "qty_below_minimum",
+                        "equity_usdt": str(equity),
+                        "max_notional_usdt": str(max_notional) if max_notional is not None else None,
+                    }
                     events.append(event)
                     self.state.save_order_event(decision_id, sleeve.sleeve_id, "skip_open", event)
                     continue
@@ -464,6 +545,8 @@ class BybitDemoRuntime:
                     "stop_loss": str(sl),
                     "leverage": str(leverage),
                     "equity_usdt": str(equity),
+                    "max_notional_usdt": str(max_notional) if max_notional is not None else None,
+                    "order_notional_usdt": str(quantize_down(qty * entry, Decimal("0.01"))),
                     "order_response": order_response,
                     "stop_response": stop_response,
                 }
@@ -568,11 +651,7 @@ def _market_snapshot(bundle: MarketBundle, config: BybitDemoBotConfig) -> dict[s
     symbols: dict[str, Any] = {}
     for symbol in config.strategy.symbols:
         ticker = bundle.tickers[symbol]
-        spread_pct = None
-        if ticker.bid1_price > 0 and ticker.ask1_price > 0:
-            mid = (ticker.bid1_price + ticker.ask1_price) / Decimal("2")
-            if mid > 0:
-                spread_pct = str((ticker.ask1_price - ticker.bid1_price) / mid)
+        spread_pct = _ticker_spread_pct(ticker)
         spec = bundle.specs[symbol]
         symbols[symbol] = {
             "last_completed_candle": _last_completed_candle(bundle, symbol),
@@ -613,6 +692,42 @@ def _last_completed_candle(bundle: MarketBundle, symbol: str) -> dict[str, Any] 
             value = None
         out[key] = value
     return out
+
+
+def _ticker_spread_pct(ticker: Any) -> str | None:
+    if ticker.bid1_price > 0 and ticker.ask1_price > 0:
+        mid = (ticker.bid1_price + ticker.ask1_price) / Decimal("2")
+        if mid > 0:
+            return str((ticker.ask1_price - ticker.bid1_price) / mid)
+    return None
+
+
+def _spread_snapshot_rows(bundle: MarketBundle, decision: Any, config: BybitDemoBotConfig) -> list[dict[str, Any]]:
+    ranked_by_symbol = {}
+    for row in getattr(decision, "ranked_rows", []) or []:
+        if isinstance(row, Mapping):
+            ranked_by_symbol[str(row.get("secid"))] = row
+    sampled_at = _utcnow_iso()
+    rows = []
+    for symbol in config.strategy.symbols:
+        ticker = bundle.tickers[symbol]
+        ranked = ranked_by_symbol.get(symbol, {})
+        rows.append(
+            {
+                "decision_as_of": bundle.decision_as_of.isoformat(),
+                "target_timestamp": bundle.target_timestamp.isoformat(),
+                "sampled_at_utc": sampled_at,
+                "symbol": symbol,
+                "last_price": str(ticker.last_price),
+                "bid1_price": str(ticker.bid1_price),
+                "ask1_price": str(ticker.ask1_price),
+                "bid_ask_spread_pct": _ticker_spread_pct(ticker),
+                "estimated_spread_pct": ranked.get("estimated_spread_pct"),
+                "execution_cost_bps": ranked.get("execution_cost_bps"),
+                "liquidity_penalty": ranked.get("liquidity_penalty"),
+            }
+        )
+    return rows
 
 
 def _decision_log_payload(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -657,6 +772,7 @@ def _decision_log_payload(result: Mapping[str, Any]) -> dict[str, Any]:
         "market_snapshot": result.get("market_snapshot"),
         "flat": result.get("flat"),
         "rebalance": result.get("rebalance"),
+        "spread_snapshots": result.get("spread_snapshots"),
         "orders": result.get("orders"),
     }
 

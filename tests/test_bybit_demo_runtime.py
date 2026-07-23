@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 import tempfile
 import unittest
 from decimal import Decimal
@@ -40,8 +41,9 @@ class FakeForecaster:
 
 
 class FakeClient:
-    def __init__(self, equity: str = "5000"):
+    def __init__(self, equity: str = "5000", positions: Mapping[str, Mapping[str, str]] | None = None):
         self.equity = Decimal(equity)
+        self.position_rows = dict(positions or {})
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def ensure_can_submit(self, *, environment: str, dry_run: bool) -> None:
@@ -51,7 +53,21 @@ class FakeClient:
         return {"result": {"list": [{"coin": [{"coin": coin, "equity": str(self.equity)}]}]}}
 
     def positions(self, *, category: str, symbol: str) -> Mapping[str, Any]:
-        return {"result": {"list": []}}
+        row = self.position_rows.get(symbol)
+        if row is None:
+            return {"result": {"list": []}}
+        return {
+            "result": {
+                "list": [
+                    {
+                        "symbol": symbol,
+                        "size": row.get("size", "0"),
+                        "side": row.get("side", ""),
+                        "avgPrice": row.get("avgPrice", "0"),
+                    }
+                ]
+            }
+        }
 
     def set_leverage(self, **kwargs: Any) -> Mapping[str, Any]:
         self.calls.append(("set_leverage", kwargs))
@@ -82,6 +98,34 @@ def bundle() -> MarketBundle:
         specs={"GRAMUSDT": spec("GRAMUSDT"), "ZECUSDT": spec("ZECUSDT")},
         decision_as_of=pd.Timestamp("2026-07-10 00:00:00"),
         target_timestamp=pd.Timestamp("2026-07-10 01:00:00"),
+    )
+
+
+def probe_config(tmp: str) -> BybitDemoBotConfig:
+    return parse_config(
+        {
+            "state_path": str(Path(tmp) / "state.sqlite3"),
+            "split": {
+                "sleeves": [
+                    {
+                        "sleeve_id": "trade_1x",
+                        "kind": "trade",
+                        "target_weight": 1.0,
+                        "leverage": 1,
+                        "max_notional_usdt": 100,
+                        "api_key_env": "BYBIT_DEMO_API_KEY",
+                        "api_secret_env": "BYBIT_DEMO_API_SECRET",
+                        "dry_run_equity_usdt": 1000,
+                    }
+                ]
+            },
+            "strategy": {
+                "entry_vol_ratio_168_min": 0.0,
+                "entry_net_pred_move_bps_min": -10000,
+                "exit_net_pred_move_bps_min": -10000,
+                "exit_vol_ratio_168_min": 0.0,
+            },
+        }
     )
 
 
@@ -147,6 +191,121 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(result["rebalance"]["status"], "submitted")
             transfer_calls = [call for call in master.calls if call[0] == "universal_transfer"]
             self.assertTrue(transfer_calls)
+
+    def test_live_open_caps_notional_and_persists_spread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = probe_config(tmp)
+            forecasts = {
+                "GRAMUSDT": ForecastRow("GRAMUSDT", 100, 100.1, 99.9, 99.7, 0, 0),
+                "ZECUSDT": ForecastRow("ZECUSDT", 100, 100.1, 99.9, 100.1, 0, 0),
+            }
+            client = FakeClient("5000")
+            state = BotStateStore(cfg.state_path)
+            runtime = BybitDemoRuntime(
+                config=cfg,
+                market=FakeMarket(bundle()),
+                forecaster=FakeForecaster(forecasts),
+                state=state,
+                master_client=FakeClient("5000"),  # type: ignore[arg-type]
+                sleeve_clients={"trade_1x": client},  # type: ignore[arg-type]
+            )
+
+            result = runtime.run_once(dry_run=False)
+
+            self.assertEqual(result["action"], "open")
+            open_events = [event for event in result["orders"] if event["action"] == "open"]
+            self.assertEqual(len(open_events), 1)
+            self.assertEqual(open_events[0]["symbol"], "GRAMUSDT")
+            self.assertEqual(open_events[0]["max_notional_usdt"], "100")
+            self.assertLessEqual(Decimal(open_events[0]["order_notional_usdt"]), Decimal("100"))
+            create_calls = [call for call in client.calls if call[0] == "create_market_order"]
+            self.assertEqual(len(create_calls), 1)
+            self.assertLessEqual(Decimal(str(create_calls[0][1]["qty"])) * Decimal("99.9"), Decimal("100"))
+            self.assertEqual(len(result["spread_snapshots"]), 2)
+            conn = sqlite3.connect(cfg.state_path)
+            try:
+                row = conn.execute(
+                    "select bid1_price, ask1_price, bid_ask_spread_pct, execution_cost_bps from spread_snapshots where symbol = ?",
+                    ("GRAMUSDT",),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], "99.9")
+            self.assertEqual(row[1], "100.1")
+            self.assertIsNotNone(row[2])
+            self.assertIsNotNone(row[3])
+
+    def test_hold_refreshes_stop_without_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = probe_config(tmp)
+            forecasts = {
+                "GRAMUSDT": ForecastRow("GRAMUSDT", 100, 100.1, 99.9, 99.7, 0, 0),
+                "ZECUSDT": ForecastRow("ZECUSDT", 100, 100.1, 99.9, 100.1, 0, 0),
+            }
+            state = BotStateStore(cfg.state_path)
+            state.set_active_episode(
+                {
+                    "symbol": "GRAMUSDT",
+                    "side": "short",
+                    "as_of": "2026-07-10T00:00:00",
+                    "target_timestamp": "2026-07-10T00:00:00",
+                    "entry_decision_id": "old",
+                    "entry_price": 99.9,
+                    "selected": {},
+                    "sleeves": {"trade_1x": {"qty": "1.0", "entry_price": "99.9"}},
+                }
+            )
+            client = FakeClient("5000", positions={"GRAMUSDT": {"size": "1.0", "side": "Sell", "avgPrice": "99.9"}})
+            runtime = BybitDemoRuntime(
+                config=cfg,
+                market=FakeMarket(bundle()),
+                forecaster=FakeForecaster(forecasts),
+                state=state,
+                master_client=FakeClient("5000"),  # type: ignore[arg-type]
+                sleeve_clients={"trade_1x": client},  # type: ignore[arg-type]
+            )
+
+            result = runtime.run_once(dry_run=False)
+
+            self.assertEqual(result["action"], "hold")
+            self.assertFalse([call for call in client.calls if call[0] == "create_market_order"])
+            stop_calls = [call for call in client.calls if call[0] == "set_trading_stop"]
+            self.assertEqual(len(stop_calls), 1)
+            self.assertEqual(result["orders"][0]["action"], "refresh_stop")
+
+    def test_side_or_symbol_change_closes_then_opens_in_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = probe_config(tmp)
+            forecasts = {
+                "GRAMUSDT": ForecastRow("GRAMUSDT", 100, 100.1, 99.9, 99.9, 0, 0),
+                "ZECUSDT": ForecastRow("ZECUSDT", 100, 100.1, 99.9, 100.4, 0, 0),
+            }
+            state = BotStateStore(cfg.state_path)
+            state.set_active_episode(
+                {
+                    "symbol": "GRAMUSDT",
+                    "side": "short",
+                    "as_of": "2026-07-10T00:00:00",
+                    "target_timestamp": "2026-07-10T00:00:00",
+                    "entry_decision_id": "old",
+                    "entry_price": 99.9,
+                    "selected": {},
+                    "sleeves": {"trade_1x": {"qty": "1.0", "entry_price": "99.9"}},
+                }
+            )
+            runtime = BybitDemoRuntime(
+                config=cfg,
+                market=FakeMarket(bundle()),
+                forecaster=FakeForecaster(forecasts),
+                state=state,
+            )
+
+            result = runtime.run_once(dry_run=True)
+
+            self.assertEqual(result["action"], "close_then_open")
+            self.assertEqual([event["action"] for event in result["orders"]], ["close", "open"])
+            self.assertEqual(result["orders"][1]["symbol"], "ZECUSDT")
 
 
 if __name__ == "__main__":

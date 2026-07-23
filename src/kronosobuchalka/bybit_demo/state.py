@@ -63,6 +63,45 @@ class BotStateStore:
                     (payload.get("as_of"), _json(payload), _now()),
                 )
 
+    def save_spread_snapshots(self, rows: list[Mapping[str, Any]]) -> None:
+        if not rows:
+            return
+        with closing(self._connect()) as conn:
+            with conn:
+                for row in rows:
+                    conn.execute(
+                        """
+                        insert or replace into spread_snapshots(
+                            decision_as_of,
+                            target_timestamp,
+                            sampled_at_utc,
+                            symbol,
+                            last_price,
+                            bid1_price,
+                            ask1_price,
+                            bid_ask_spread_pct,
+                            estimated_spread_pct,
+                            execution_cost_bps,
+                            liquidity_penalty,
+                            payload_json
+                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row.get("decision_as_of"),
+                            row.get("target_timestamp"),
+                            row.get("sampled_at_utc"),
+                            row.get("symbol"),
+                            row.get("last_price"),
+                            row.get("bid1_price"),
+                            row.get("ask1_price"),
+                            row.get("bid_ask_spread_pct"),
+                            row.get("estimated_spread_pct"),
+                            row.get("execution_cost_bps"),
+                            row.get("liquidity_penalty"),
+                            _json(row),
+                        ),
+                    )
+
     def set_reconciliation(self, status: str, reason: str, payload: Mapping[str, Any] | None = None) -> None:
         with closing(self._connect()) as conn:
             with conn:
@@ -140,6 +179,21 @@ class BotStateStore:
                     as_of text,
                     payload_json text not null,
                     created_at text not null
+                );
+                create table if not exists spread_snapshots(
+                    decision_as_of text not null,
+                    target_timestamp text not null,
+                    sampled_at_utc text not null,
+                    symbol text not null,
+                    last_price text not null,
+                    bid1_price text not null,
+                    ask1_price text not null,
+                    bid_ask_spread_pct text,
+                    estimated_spread_pct real,
+                    execution_cost_bps real,
+                    liquidity_penalty real,
+                    payload_json text not null,
+                    primary key(decision_as_of, symbol)
                 );
                 create table if not exists reconciliation(
                     id integer primary key check(id = 1),

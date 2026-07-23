@@ -53,6 +53,7 @@ class SleeveConfig:
     kind: str = "trade"
     target_weight: float = 0.0
     leverage: float = 1.0
+    max_notional_usdt: float = 0.0
     api_key_env: str = ""
     api_secret_env: str = ""
     member_id: str = ""
@@ -119,6 +120,9 @@ class BybitDemoBotConfig:
             raise ValueError("at least one trade sleeve is required")
         if len({sleeve.sleeve_id for sleeve in self.split.sleeves}) != len(self.split.sleeves):
             raise ValueError("sleeve_id values must be unique")
+        for sleeve in self.split.sleeves:
+            if float(sleeve.max_notional_usdt) < 0:
+                raise ValueError("sleeve max_notional_usdt must be non-negative")
 
     def master_credentials(self) -> BybitCredentials:
         return _credentials_from_env(self.master_account.api_key_env, self.master_account.api_secret_env)
