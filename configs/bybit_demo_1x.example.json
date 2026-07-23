@@ -8,7 +8,7 @@
   "loop_sleep_seconds": 30,
   "recv_window": 15000,
   "request_timeout_seconds": 30,
-  "request_retries": 2,
+  "request_retries": 4,
   "master_account": {
     "api_key_env": "BYBIT_DEMO_API_KEY",
     "api_secret_env": "BYBIT_DEMO_API_SECRET",

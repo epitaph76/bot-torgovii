@@ -96,7 +96,7 @@ class BybitDemoBotConfig:
     loop_sleep_seconds: int = 30
     recv_window: int = 15000
     request_timeout_seconds: float = 15.0
-    request_retries: int = 2
+    request_retries: int = 4
     master_account: MasterAccountConfig = field(default_factory=MasterAccountConfig)
     split: SplitPortfolioConfig = field(default_factory=SplitPortfolioConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
