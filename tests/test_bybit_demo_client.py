@@ -97,6 +97,19 @@ class BybitClientTests(unittest.TestCase):
         self.assertEqual(session.wallet_headers[0]["X-BAPI-TIMESTAMP"], "1000")
         self.assertEqual(session.wallet_headers[1]["X-BAPI-TIMESTAMP"], "2100")
 
+    def test_set_leverage_accepts_already_set_retcode(self) -> None:
+        class FakeSession:
+            def post(self, url: str, *, headers: Mapping[str, str], data: str, timeout: float) -> FakeResponse:
+                if "/v5/position/set-leverage" not in url:
+                    raise AssertionError(f"unexpected URL: {url}")
+                return FakeResponse({"retCode": 110043, "retMsg": "leverage not modified", "result": {}})
+
+        client = BybitV5Client(credentials=BybitCredentials("key", "secret"), session=FakeSession())  # type: ignore[arg-type]
+        payload = client.set_leverage(category="linear", symbol="ZECUSDT", leverage=1, environment="bybit_demo", dry_run=False)
+
+        self.assertEqual(payload["retCode"], 0)
+        self.assertEqual(payload["retExtInfo"]["ignoredRetCode"], 110043)
+
 
 if __name__ == "__main__":
     unittest.main()

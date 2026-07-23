@@ -119,17 +119,25 @@ class BybitV5Client:
         dry_run: bool,
     ) -> Mapping[str, Any]:
         leverage_s = _decimal_text(Decimal(str(leverage)))
-        return self.private_post(
-            "/v5/position/set-leverage",
-            {
-                "category": category,
-                "symbol": symbol,
-                "buyLeverage": leverage_s,
-                "sellLeverage": leverage_s,
-            },
-            environment=environment,
-            dry_run=dry_run,
-        )
+        body = {
+            "category": category,
+            "symbol": symbol,
+            "buyLeverage": leverage_s,
+            "sellLeverage": leverage_s,
+        }
+        try:
+            return self.private_post("/v5/position/set-leverage", body, environment=environment, dry_run=dry_run)
+        except BybitDemoError as exc:
+            message = str(exc)
+            if "retCode=110043" in message and "leverage not modified" in message:
+                return {
+                    "retCode": 0,
+                    "retMsg": "leverage not modified",
+                    "result": body,
+                    "retExtInfo": {"ignoredRetCode": 110043},
+                    "time": _timestamp_ms(),
+                }
+            raise
 
     def create_market_order(
         self,
