@@ -44,6 +44,7 @@ class BybitMarketData:
     def __init__(self, *, client: BybitV5Client, config: BybitDemoBotConfig):
         self.client = client
         self.config = config
+        self._spec_cache: dict[str, InstrumentSpec] = {}
 
     def load_bundle(self) -> MarketBundle:
         strategy = self.config.strategy
@@ -74,6 +75,9 @@ class BybitMarketData:
         )
 
     def instrument_spec(self, symbol: str) -> InstrumentSpec:
+        cached = self._spec_cache.get(symbol)
+        if cached is not None:
+            return cached
         payload = self.client.instruments_info(category=self.config.strategy.category, symbol=symbol)
         rows = _result_list(payload)
         if not rows:
@@ -84,7 +88,7 @@ class BybitMarketData:
         leverage = row.get("leverageFilter") or {}
         if str(row.get("status")) != "Trading":
             raise RuntimeError(f"instrument is not trading: {symbol} status={row.get('status')}")
-        return InstrumentSpec(
+        spec = InstrumentSpec(
             symbol=symbol,
             tick_size=_decimal(price.get("tickSize"), "0.0001"),
             qty_step=_decimal(lot.get("qtyStep"), "0.001"),
@@ -93,6 +97,8 @@ class BybitMarketData:
             max_market_qty=_decimal(lot.get("maxMktOrderQty"), lot.get("maxOrderQty", "0")),
             max_leverage=_decimal(leverage.get("maxLeverage"), "1"),
         )
+        self._spec_cache[symbol] = spec
+        return spec
 
     def ticker(self, symbol: str) -> Ticker:
         payload = self.client.ticker(category=self.config.strategy.category, symbol=symbol)

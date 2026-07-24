@@ -171,19 +171,27 @@ class BybitV5Client:
         environment: str,
         dry_run: bool,
     ) -> Mapping[str, Any]:
-        return self.private_post(
-            "/v5/position/trading-stop",
-            {
-                "category": category,
-                "symbol": symbol,
-                "tpslMode": "Full",
-                "stopLoss": _decimal_text(stop_loss),
-                "slTriggerBy": trigger_by,
-                "positionIdx": 0,
-            },
-            environment=environment,
-            dry_run=dry_run,
-        )
+        body = {
+            "category": category,
+            "symbol": symbol,
+            "tpslMode": "Full",
+            "stopLoss": _decimal_text(stop_loss),
+            "slTriggerBy": trigger_by,
+            "positionIdx": 0,
+        }
+        try:
+            return self.private_post("/v5/position/trading-stop", body, environment=environment, dry_run=dry_run)
+        except BybitDemoError as exc:
+            message = str(exc).lower()
+            if "retcode=34040" in message and "not modified" in message:
+                return {
+                    "retCode": 0,
+                    "retMsg": "trading stop not modified",
+                    "result": body,
+                    "retExtInfo": {"ignoredRetCode": 34040},
+                    "time": _timestamp_ms(),
+                }
+            raise
 
     def universal_transfer(
         self,

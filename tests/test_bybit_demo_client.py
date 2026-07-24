@@ -110,6 +110,26 @@ class BybitClientTests(unittest.TestCase):
         self.assertEqual(payload["retCode"], 0)
         self.assertEqual(payload["retExtInfo"]["ignoredRetCode"], 110043)
 
+    def test_set_trading_stop_accepts_not_modified_retcode(self) -> None:
+        class FakeSession:
+            def post(self, url: str, *, headers: Mapping[str, str], data: str, timeout: float) -> FakeResponse:
+                if "/v5/position/trading-stop" not in url:
+                    raise AssertionError(f"unexpected URL: {url}")
+                return FakeResponse({"retCode": 34040, "retMsg": "not modified", "result": {}})
+
+        client = BybitV5Client(credentials=BybitCredentials("key", "secret"), session=FakeSession())  # type: ignore[arg-type]
+        payload = client.set_trading_stop(
+            category="linear",
+            symbol="ZECUSDT",
+            stop_loss=Decimal("536.55"),
+            trigger_by="LastPrice",
+            environment="bybit_demo",
+            dry_run=False,
+        )
+
+        self.assertEqual(payload["retCode"], 0)
+        self.assertEqual(payload["retExtInfo"]["ignoredRetCode"], 34040)
+
 
 if __name__ == "__main__":
     unittest.main()
