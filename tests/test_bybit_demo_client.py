@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -16,10 +17,12 @@ if str(SRC) not in sys.path:
 
 from kronosobuchalka.bybit_demo.client import (  # noqa: E402
     DEMO_BASE_URL,
+    BybitAPIError,
     BybitCredentials,
     BybitDemoError,
     BybitV5Client,
     _auth_headers,
+    classify_bybit_error,
     _server_time_ms,
     quantize_down,
 )
@@ -71,6 +74,15 @@ class BybitClientTests(unittest.TestCase):
         self.assertEqual(_server_time_ms({"result": {"timeSecond": "2"}}), 2000)
         self.assertEqual(_server_time_ms({"result": {"timeNano": "2500000000"}}), 2500)
         self.assertEqual(_server_time_ms({"time": "3000"}), 3000)
+
+    def test_error_policy_classifies_strategy_relevant_codes(self) -> None:
+        self.assertEqual(classify_bybit_error(ret_code=10002).action, "resync_clock")
+        self.assertEqual(classify_bybit_error(ret_code=10006).action, "retry")
+        self.assertEqual(classify_bybit_error(ret_code=110043).action, "no_op_candidate")
+        self.assertEqual(classify_bybit_error(ret_code=34040).action, "no_op_candidate")
+        self.assertEqual(classify_bybit_error(ret_code=110004).reason, "margin_balance_or_risk_limit")
+        self.assertEqual(classify_bybit_error(ret_code=110072).reason, "position_order_state")
+        self.assertEqual(classify_bybit_error(status_code=429).action, "retry")
 
     def test_private_request_resyncs_timestamp_after_retcode_10002(self) -> None:
         class FakeSession:
@@ -129,6 +141,81 @@ class BybitClientTests(unittest.TestCase):
 
         self.assertEqual(payload["retCode"], 0)
         self.assertEqual(payload["retExtInfo"]["ignoredRetCode"], 34040)
+
+    def test_safe_post_retries_transient_retcode(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.posts = 0
+
+            def post(self, url: str, *, headers: Mapping[str, str], data: str, timeout: float) -> FakeResponse:
+                self.posts += 1
+                if self.posts == 1:
+                    return FakeResponse({"retCode": 10006, "retMsg": "Too many visits"})
+                return FakeResponse({"retCode": 0, "retMsg": "OK", "result": {}})
+
+        session = FakeSession()
+        client = BybitV5Client(credentials=BybitCredentials("key", "secret"), session=session, retries=1)  # type: ignore[arg-type]
+        payload = client.set_trading_stop(
+            category="linear",
+            symbol="ZECUSDT",
+            stop_loss=Decimal("474.56"),
+            trigger_by="LastPrice",
+            environment="bybit_demo",
+            dry_run=False,
+        )
+
+        self.assertEqual(payload["retCode"], 0)
+        self.assertEqual(session.posts, 2)
+
+    def test_market_order_does_not_retry_transient_retcode_without_reconciliation(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.posts = 0
+
+            def post(self, url: str, *, headers: Mapping[str, str], data: str, timeout: float) -> FakeResponse:
+                self.posts += 1
+                return FakeResponse({"retCode": 10006, "retMsg": "Too many visits"})
+
+        session = FakeSession()
+        client = BybitV5Client(credentials=BybitCredentials("key", "secret"), session=session, retries=2)  # type: ignore[arg-type]
+        with self.assertRaises(BybitAPIError) as raised:
+            client.create_market_order(
+                category="linear",
+                symbol="ZECUSDT",
+                side="Buy",
+                qty=Decimal("0.2"),
+                reduce_only=False,
+                environment="bybit_demo",
+                dry_run=False,
+                order_link_id="krn-test",
+            )
+
+        self.assertEqual(session.posts, 1)
+        self.assertEqual(raised.exception.policy.action, "retry")
+
+    def test_market_order_sends_order_link_id(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.body: Mapping[str, Any] = {}
+
+            def post(self, url: str, *, headers: Mapping[str, str], data: str, timeout: float) -> FakeResponse:
+                self.body = json.loads(data)
+                return FakeResponse({"retCode": 0, "retMsg": "OK", "result": {"orderId": "abc"}})
+
+        session = FakeSession()
+        client = BybitV5Client(credentials=BybitCredentials("key", "secret"), session=session)  # type: ignore[arg-type]
+        client.create_market_order(
+            category="linear",
+            symbol="ZECUSDT",
+            side="Buy",
+            qty=Decimal("0.2"),
+            reduce_only=False,
+            environment="bybit_demo",
+            dry_run=False,
+            order_link_id="krn-test",
+        )
+
+        self.assertEqual(session.body["orderLinkId"], "krn-test")
 
 
 if __name__ == "__main__":

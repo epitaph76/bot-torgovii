@@ -9,7 +9,18 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Mapping
 
-from .client import DEMO_BASE_URL, BybitCredentials, BybitDemoError, BybitV5Client, quantize_down
+from .client import (
+    DEMO_BASE_URL,
+    BybitAPIError,
+    BybitCredentials,
+    BybitDemoError,
+    BybitTransportError,
+    BybitV5Client,
+    handled_bybit_error_response,
+    is_duplicate_order_link_error,
+    is_position_already_flat_error,
+    quantize_down,
+)
 from .config import BybitDemoBotConfig, SleeveConfig
 from .market import BybitMarketData, MarketBundle
 from .state import BotStateStore
@@ -74,6 +85,19 @@ class BybitDemoRuntime:
         reason = decision.reason
         if rebalance_only:
             reason = "rebalance_only"
+        elif not active and not flat and not dry_run:
+            action = "blocked"
+            reason = "exchange_position_without_active_episode"
+            self.state.set_reconciliation(
+                "blocked",
+                reason,
+                {
+                    "flat": flat_payload,
+                    "decision_as_of": decision.as_of,
+                    "target_timestamp": decision.target_timestamp,
+                    "selected": decision.selected,
+                },
+            )
         else:
             can_hold, hold_reason = active_can_hold(active=active, decision=decision, config=self.config)
             if active and can_hold:
@@ -162,8 +186,9 @@ class BybitDemoRuntime:
                 result = self.run_once(dry_run=dry_run)
                 print(json.dumps(_decision_log_payload(result), ensure_ascii=False, default=str), flush=True)
             except Exception as exc:
-                self.state.set_reconciliation("blocked", f"runtime_error:{type(exc).__name__}", {"error": str(exc)})
-                print(json.dumps({"event": "runtime_error", "status": "blocked", "error": str(exc), "now_utc": _utcnow_iso()}, ensure_ascii=False), flush=True)
+                reason, details = _runtime_error_reconciliation(exc)
+                self.state.set_reconciliation("blocked", reason, details)
+                print(json.dumps({"event": "runtime_error", "status": "blocked", "now_utc": _utcnow_iso(), **details}, ensure_ascii=False), flush=True)
                 time.sleep(max(int(self.config.loop_sleep_seconds), 1))
 
     def _sleep_until_decision(self, *, target_dt: datetime, dry_run: bool) -> None:
@@ -467,17 +492,57 @@ class BybitDemoRuntime:
             if qty <= 0:
                 continue
             close_side = "Sell" if side == "long" else "Buy"
-            response = client.create_market_order(
-                category=self.config.strategy.category,
-                symbol=symbol,
-                side=close_side,
-                qty=qty,
-                reduce_only=True,
-                environment=self.config.environment,
-                dry_run=dry_run,
-            )
-            event = {"sleeve_id": sleeve.sleeve_id, "action": "close", "symbol": symbol, "side": close_side, "qty": str(qty), "reason": reason, "response": response}
-            self.state.save_order_event(decision_id, sleeve.sleeve_id, "close", event)
+            order_link_id = _order_link_id(decision_id, sleeve.sleeve_id, "close", symbol)
+            action = "close"
+            try:
+                response = client.create_market_order(
+                    category=self.config.strategy.category,
+                    symbol=symbol,
+                    side=close_side,
+                    qty=qty,
+                    reduce_only=True,
+                    environment=self.config.environment,
+                    dry_run=dry_run,
+                    order_link_id=order_link_id,
+                )
+            except BybitAPIError as exc:
+                if is_position_already_flat_error(exc) or is_duplicate_order_link_error(exc):
+                    qty_after, _, _ = _position(client.positions(category=self.config.strategy.category, symbol=symbol))
+                    if qty_after <= 0:
+                        action = "close_noop"
+                        response = handled_bybit_error_response(exc, reason="close_verified_exchange_flat")
+                    else:
+                        raise
+                else:
+                    raise
+            except BybitTransportError as exc:
+                qty_after, _, _ = _position(client.positions(category=self.config.strategy.category, symbol=symbol))
+                if qty_after <= 0:
+                    action = "close_verified"
+                    response = {
+                        "retCode": 0,
+                        "retMsg": "close transport error but exchange is flat",
+                        "result": {},
+                        "retExtInfo": {
+                            "transportError": str(exc.original),
+                            "policy": exc.policy.action,
+                            "policyReason": exc.policy.reason,
+                        },
+                        "time": _timestamp_ms_like(),
+                    }
+                else:
+                    raise
+            event = {
+                "sleeve_id": sleeve.sleeve_id,
+                "action": action,
+                "symbol": symbol,
+                "side": close_side,
+                "qty": str(qty),
+                "reason": reason,
+                "order_link_id": order_link_id,
+                "response": response,
+            }
+            self.state.save_order_event(decision_id, sleeve.sleeve_id, action, event)
             orders.append(event)
         return orders
 
@@ -515,17 +580,55 @@ class BybitDemoRuntime:
                     self.state.save_order_event(decision_id, sleeve.sleeve_id, "skip_open", event)
                     continue
                 client.set_leverage(category=self.config.strategy.category, symbol=symbol, leverage=float(leverage), environment=self.config.environment, dry_run=dry_run)
-                order_response = client.create_market_order(
-                    category=self.config.strategy.category,
-                    symbol=symbol,
-                    side=bybit_side,
-                    qty=qty,
-                    reduce_only=False,
-                    environment=self.config.environment,
-                    dry_run=dry_run,
-                )
+                order_link_id = _order_link_id(decision_id, sleeve.sleeve_id, "open", symbol)
+                stop_entry = entry
+                try:
+                    order_response = client.create_market_order(
+                        category=self.config.strategy.category,
+                        symbol=symbol,
+                        side=bybit_side,
+                        qty=qty,
+                        reduce_only=False,
+                        environment=self.config.environment,
+                        dry_run=dry_run,
+                        order_link_id=order_link_id,
+                    )
+                except BybitAPIError as exc:
+                    if is_duplicate_order_link_error(exc) and not dry_run:
+                        verified_qty, verified_side, verified_avg = _position(client.positions(category=self.config.strategy.category, symbol=symbol))
+                        if verified_qty > 0 and verified_side == bybit_side:
+                            qty = verified_qty
+                            if verified_avg > 0:
+                                stop_entry = verified_avg
+                            order_response = handled_bybit_error_response(exc, reason="open_duplicate_verified_position")
+                        else:
+                            raise
+                    else:
+                        raise
+                except BybitTransportError as exc:
+                    if not dry_run:
+                        verified_qty, verified_side, verified_avg = _position(client.positions(category=self.config.strategy.category, symbol=symbol))
+                        if verified_qty > 0 and verified_side == bybit_side:
+                            qty = verified_qty
+                            if verified_avg > 0:
+                                stop_entry = verified_avg
+                            order_response = {
+                                "retCode": 0,
+                                "retMsg": "open transport error but position verified",
+                                "result": {},
+                                "retExtInfo": {
+                                    "transportError": str(exc.original),
+                                    "policy": exc.policy.action,
+                                    "policyReason": exc.policy.reason,
+                                },
+                                "time": _timestamp_ms_like(),
+                            }
+                        else:
+                            raise
+                    else:
+                        raise
                 opened.append((sleeve, qty))
-                sl = stop_price(side=final_side, entry_price=entry, stop_loss_pct=float(self.config.strategy.stop_loss_pct), spec=spec)
+                sl = stop_price(side=final_side, entry_price=stop_entry, stop_loss_pct=float(self.config.strategy.stop_loss_pct), spec=spec)
                 stop_response = client.set_trading_stop(
                     category=self.config.strategy.category,
                     symbol=symbol,
@@ -542,11 +645,13 @@ class BybitDemoRuntime:
                     "final_side": final_side,
                     "qty": str(qty),
                     "entry_price": str(entry),
+                    "stop_entry_price": str(stop_entry),
                     "stop_loss": str(sl),
                     "leverage": str(leverage),
                     "equity_usdt": str(equity),
                     "max_notional_usdt": str(max_notional) if max_notional is not None else None,
                     "order_notional_usdt": str(quantize_down(qty * entry, Decimal("0.01"))),
+                    "order_link_id": order_link_id,
                     "order_response": order_response,
                     "stop_response": stop_response,
                 }
@@ -565,6 +670,7 @@ class BybitDemoRuntime:
                         reduce_only=True,
                         environment=self.config.environment,
                         dry_run=dry_run,
+                        order_link_id=_order_link_id(decision_id, sleeve.sleeve_id, "rollback", symbol),
                     )
                     rollback_event = {"sleeve_id": sleeve.sleeve_id, "action": "rollback_close", "symbol": symbol, "qty": str(qty), "response": rollback}
                     self.state.save_order_event(decision_id, sleeve.sleeve_id, "rollback_close", rollback_event)
@@ -610,6 +716,11 @@ def next_decision_datetime(*, delay_seconds: int) -> datetime:
 def _decision_id(as_of: str, selected: Mapping[str, Any] | None, *, rebalance_only: bool) -> str:
     raw = json.dumps({"as_of": as_of, "selected": selected, "rebalance_only": rebalance_only}, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _order_link_id(decision_id: str, sleeve_id: str, action: str, symbol: str) -> str:
+    raw = f"{decision_id}:{sleeve_id}:{action}:{symbol}"
+    return "krn-" + hashlib.blake2s(raw.encode("utf-8"), digest_size=12).hexdigest()
 
 
 def _entry_price(bundle: MarketBundle, selected: Mapping[str, Any]) -> float:
@@ -779,7 +890,48 @@ def _decision_log_payload(result: Mapping[str, Any]) -> dict[str, Any]:
 
 def _payload_blocks_reconciliation(payload: Mapping[str, Any]) -> bool:
     rebalance = payload.get("rebalance")
-    return isinstance(rebalance, Mapping) and rebalance.get("status") == "blocked"
+    return payload.get("action") == "blocked" or (isinstance(rebalance, Mapping) and rebalance.get("status") == "blocked")
+
+
+def _runtime_error_reconciliation(exc: Exception) -> tuple[str, dict[str, Any]]:
+    details: dict[str, Any] = {
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
+    if isinstance(exc, BybitAPIError):
+        details.update(
+            {
+                "ret_code": exc.ret_code,
+                "ret_msg": exc.ret_msg,
+                "http_status": exc.status_code,
+                "method": exc.method,
+                "path": exc.path,
+                "policy_action": exc.policy.action,
+                "policy_reason": exc.policy.reason,
+                "retryable": exc.policy.retryable,
+                "blocks_trading": exc.policy.blocks_trading,
+                "needs_reconciliation": exc.policy.needs_reconciliation,
+            }
+        )
+        return f"bybit_api_error:{exc.policy.reason}", details
+    if isinstance(exc, BybitTransportError):
+        details.update(
+            {
+                "method": exc.method,
+                "path": exc.path,
+                "policy_action": exc.policy.action,
+                "policy_reason": exc.policy.reason,
+                "retryable": exc.policy.retryable,
+                "blocks_trading": exc.policy.blocks_trading,
+                "needs_reconciliation": exc.policy.needs_reconciliation,
+            }
+        )
+        return "bybit_transport_error", details
+    return f"runtime_error:{type(exc).__name__}", details
+
+
+def _timestamp_ms_like() -> int:
+    return int(time.time() * 1000)
 
 
 def _utcnow_iso() -> str:

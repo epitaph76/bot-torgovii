@@ -16,6 +16,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from kronosobuchalka.bybit_demo.client import BybitAPIError  # noqa: E402
 from kronosobuchalka.bybit_demo.config import BybitDemoBotConfig, parse_config  # noqa: E402
 from kronosobuchalka.bybit_demo.market import InstrumentSpec, MarketBundle, Ticker  # noqa: E402
 from kronosobuchalka.bybit_demo.runtime import BybitDemoRuntime  # noqa: E402
@@ -83,6 +84,19 @@ class FakeClient:
 
     def universal_transfer(self, **kwargs: Any) -> Mapping[str, Any]:
         self.calls.append(("universal_transfer", kwargs))
+        return {"ok": True, "kwargs": kwargs}
+
+
+class DuplicateOpenClient(FakeClient):
+    def __init__(self, equity: str, verified_positions: Mapping[str, Mapping[str, str]]):
+        super().__init__(equity)
+        self.verified_positions = dict(verified_positions)
+
+    def create_market_order(self, **kwargs: Any) -> Mapping[str, Any]:
+        self.calls.append(("create_market_order", kwargs))
+        if not bool(kwargs.get("reduce_only")):
+            self.position_rows = dict(self.verified_positions)
+            raise BybitAPIError(method="POST", path="/v5/order/create", ret_code=110072, ret_msg="OrderLinkedID is duplicate")
         return {"ok": True, "kwargs": kwargs}
 
 
@@ -221,6 +235,7 @@ class RuntimeTests(unittest.TestCase):
             create_calls = [call for call in client.calls if call[0] == "create_market_order"]
             self.assertEqual(len(create_calls), 1)
             self.assertLessEqual(Decimal(str(create_calls[0][1]["qty"])) * Decimal("99.9"), Decimal("100"))
+            self.assertTrue(str(create_calls[0][1]["order_link_id"]).startswith("krn-"))
             self.assertEqual(len(result["spread_snapshots"]), 2)
             conn = sqlite3.connect(cfg.state_path)
             try:
@@ -235,6 +250,57 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(row[1], "100.1")
             self.assertIsNotNone(row[2])
             self.assertIsNotNone(row[3])
+
+    def test_duplicate_open_order_is_verified_before_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = probe_config(tmp)
+            forecasts = {
+                "GRAMUSDT": ForecastRow("GRAMUSDT", 100, 100.1, 99.9, 99.7, 0, 0),
+                "ZECUSDT": ForecastRow("ZECUSDT", 100, 100.1, 99.9, 100.1, 0, 0),
+            }
+            client = DuplicateOpenClient("5000", verified_positions={"GRAMUSDT": {"size": "1.0", "side": "Sell", "avgPrice": "99.9"}})
+            runtime = BybitDemoRuntime(
+                config=cfg,
+                market=FakeMarket(bundle()),
+                forecaster=FakeForecaster(forecasts),
+                state=BotStateStore(cfg.state_path),
+                master_client=FakeClient("5000"),  # type: ignore[arg-type]
+                sleeve_clients={"trade_1x": client},  # type: ignore[arg-type]
+            )
+
+            result = runtime.run_once(dry_run=False)
+
+            self.assertEqual(result["action"], "open")
+            open_event = [event for event in result["orders"] if event["action"] == "open"][0]
+            self.assertEqual(open_event["order_response"]["retExtInfo"]["handledRetCode"], 110072)
+            self.assertEqual(open_event["qty"], "1.0")
+            self.assertEqual(open_event["stop_entry_price"], "99.9")
+            self.assertTrue([call for call in client.calls if call[0] == "set_trading_stop"])
+
+    def test_exchange_position_without_active_episode_blocks_new_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = probe_config(tmp)
+            forecasts = {
+                "GRAMUSDT": ForecastRow("GRAMUSDT", 100, 100.1, 99.9, 99.7, 0, 0),
+                "ZECUSDT": ForecastRow("ZECUSDT", 100, 100.1, 99.9, 100.1, 0, 0),
+            }
+            state = BotStateStore(cfg.state_path)
+            client = FakeClient("5000", positions={"ZECUSDT": {"size": "0.2", "side": "Buy", "avgPrice": "100.0"}})
+            runtime = BybitDemoRuntime(
+                config=cfg,
+                market=FakeMarket(bundle()),
+                forecaster=FakeForecaster(forecasts),
+                state=state,
+                master_client=FakeClient("5000"),  # type: ignore[arg-type]
+                sleeve_clients={"trade_1x": client},  # type: ignore[arg-type]
+            )
+
+            result = runtime.run_once(dry_run=False)
+
+            self.assertEqual(result["action"], "blocked")
+            self.assertEqual(result["reason"], "exchange_position_without_active_episode")
+            self.assertFalse([call for call in client.calls if call[0] == "create_market_order"])
+            self.assertEqual(state.reconciliation()["reason"], "exchange_position_without_active_episode")  # type: ignore[index]
 
     def test_hold_refreshes_stop_without_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
