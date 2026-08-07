@@ -24,7 +24,7 @@
         "kind": "trade",
         "target_weight": 1.0,
         "leverage": 1,
-        "max_notional_usdt": 100,
+        "max_notional_usdt": 0,
         "api_key_env": "BYBIT_DEMO_API_KEY",
         "api_secret_env": "BYBIT_DEMO_API_SECRET",
         "member_id": "",
@@ -34,19 +34,88 @@
     ]
   },
   "strategy": {
-    "symbols": ["GRAMUSDT", "ZECUSDT"],
+    "symbols": ["GRAMUSDT", "ZECUSDT", "BTCUSDT", "SOLUSDT"],
+    "ranking_mode": "rank1_only",
     "category": "linear",
     "interval": "60",
     "history_limit": 720,
-    "entry_vol_ratio_168_min": 0.0,
-    "entry_net_pred_move_bps_min": -10000,
-    "exit_net_pred_move_bps_min": -10000,
-    "exit_vol_ratio_168_min": 0.0,
-    "hl_relevant_wick_ratio_168_min": 5.0,
-    "hl_range_ratio_168_min": 2.25,
+    "symbol_filters": {
+      "GRAMUSDT": {
+        "entry": {
+          "net_pred_move_bps_min": 250.0,
+          "vol_ratio_lookback_hours": 168,
+          "vol_ratio_min": 1.0,
+          "execution_cost_bps_max": 90.0
+        },
+        "hold": {
+          "net_pred_move_bps_min": -29.04327270616809,
+          "vol_ratio_168_min": 0.47871711434769354
+        },
+        "flip": {
+          "enabled": true,
+          "hl_relevant_wick_ratio_168_min": 2.4,
+          "hl_range_ratio_168_min": 2.6,
+          "pred_relevant_wick_bps_min": 475.0,
+          "pred_range_bps_min": 425.0
+        }
+      },
+      "ZECUSDT": {
+        "entry": {
+          "net_pred_move_bps_min": 225.0,
+          "vol_ratio_lookback_hours": 168,
+          "vol_ratio_min": 1.15,
+          "execution_cost_bps_max": 45.0
+        },
+        "hold": {
+          "net_pred_move_bps_min": -96.13795519570391,
+          "vol_ratio_168_min": 0.2368121471906064
+        },
+        "flip": {
+          "enabled": true,
+          "hl_relevant_wick_ratio_168_min": 5.4,
+          "hl_range_ratio_168_min": 1.4,
+          "pred_relevant_wick_bps_min": 150.0,
+          "pred_range_bps_min": 350.0
+        }
+      },
+      "BTCUSDT": {
+        "entry": {
+          "net_pred_move_bps_min": 80.0,
+          "vol_ratio_lookback_hours": 72,
+          "vol_ratio_min": 1.0353848575059572,
+          "execution_cost_bps_max": 28.0
+        },
+        "hold": {
+          "net_pred_move_bps_min": -78.0846698099054,
+          "vol_ratio_168_min": 0.29448688328479167
+        },
+        "flip": {
+          "enabled": false
+        }
+      },
+      "SOLUSDT": {
+        "entry": {
+          "net_pred_move_bps_min": 75.0,
+          "vol_ratio_lookback_hours": 168,
+          "vol_ratio_min": 1.7870197723635848,
+          "execution_cost_bps_max": 110.0
+        },
+        "hold": {
+          "net_pred_move_bps_min": 1.4498890529524076,
+          "vol_ratio_168_min": 0.20183664376091726
+        },
+        "flip": {
+          "enabled": true,
+          "hl_relevant_wick_ratio_168_min": 5.727852334173372,
+          "hl_range_ratio_168_min": 3.0170374821005317,
+          "pred_relevant_wick_bps_min": 312.38583620510633,
+          "pred_range_bps_min": 437.0151611157405
+        }
+      }
+    },
     "stop_loss_pct": 0.05,
     "sl_trigger_by": "LastPrice",
-    "commission_rate": 0.0005,
+    "commission_rate": 0.00068,
     "minimum_spread_pct": 0.0002,
     "maximum_spread_pct": 0.003,
     "slippage_spread_multiplier": 0.5,

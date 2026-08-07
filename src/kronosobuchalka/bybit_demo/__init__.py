@@ -1,4 +1,4 @@
-"""Bybit Demo runtime for the GRAM/ZEC Kronos strategy."""
+"""Bybit Demo runtime for the Kronos Tigrinya strategy."""
 
 from .config import BybitDemoBotConfig, load_config
 from .runtime import BybitDemoRuntime

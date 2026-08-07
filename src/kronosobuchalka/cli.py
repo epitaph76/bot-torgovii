@@ -22,6 +22,7 @@ from .kronos_labeler import (
 )
 from .bybit_demo.commands import add_bybit_demo_parser, handle_bybit_demo
 from .okx_demo.commands import add_okx_demo_parser, handle_okx_demo
+from .bybit_demo.commands import DEFAULT_CONFIG_PATH
 
 
 DEFAULT_SYMBOLS = ("TONUSDT", "ZECUSDT")
@@ -42,6 +43,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return handle_bybit_demo(args)
     if args.command == "okx-demo":
         return handle_okx_demo(args)
+    if args.command == "tui":
+        return _cmd_tui(args)
     parser.print_help()
     return 2
 
@@ -197,6 +200,10 @@ def _parser() -> argparse.ArgumentParser:
     add_bybit_demo_parser(sub)
     add_okx_demo_parser(sub)
 
+    tui = sub.add_parser("tui", help="Открыть терминальный интерфейс Bybit Demo бота.")
+    tui.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    tui.set_defaults(func=_cmd_tui)
+
     return parser
 
 
@@ -249,6 +256,12 @@ def _days(start: date, end: date):
     while cursor <= end:
         yield cursor
         cursor += timedelta(days=1)
+
+
+def _cmd_tui(args: argparse.Namespace) -> int:
+    from .bybit_demo.tui import run_tui
+
+    return run_tui(config_path=args.config)
 
 
 if __name__ == "__main__":

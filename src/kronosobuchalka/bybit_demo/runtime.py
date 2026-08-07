@@ -7,6 +7,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Mapping
 
 from .client import (
@@ -26,6 +27,7 @@ from .market import BybitMarketData, MarketBundle
 from .state import BotStateStore
 from .strategy import (
     KronosLiveForecaster,
+    active_decision_row,
     active_can_hold,
     build_strategy_decision,
     order_qty,
@@ -101,11 +103,12 @@ class BybitDemoRuntime:
         else:
             can_hold, hold_reason = active_can_hold(active=active, decision=decision, config=self.config)
             if active and can_hold:
+                active_row = active_decision_row(active=active, decision=decision)
                 stop_orders = self._refresh_stops_for_active(
                     decision_id=decision_id,
                     bundle=bundle,
                     active=active,
-                    selected=decision.selected or {},
+                    selected=active_row or decision.selected or {},
                     dry_run=dry_run,
                 )
                 orders.extend(stop_orders)
@@ -114,7 +117,7 @@ class BybitDemoRuntime:
                 updated = dict(active)
                 updated["as_of"] = decision.as_of
                 updated["target_timestamp"] = decision.target_timestamp
-                updated["last_decision"] = decision.selected
+                updated["last_decision"] = active_row or decision.selected
                 updated["last_stop_refresh"] = stop_orders
                 self.state.set_active_episode(updated)
             else:
@@ -178,10 +181,16 @@ class BybitDemoRuntime:
             self.state.clear_reconciliation()
         return payload
 
-    def run_forever(self, *, dry_run: bool = False) -> None:
+    def run_forever(self, *, dry_run: bool = False, stop_file: str | Path | None = None) -> None:
+        stop_path = Path(stop_file) if stop_file else None
         while True:
+            if _stop_requested(stop_path):
+                print(json.dumps({"event": "shutdown", "reason": "stop_requested", "now_utc": _utcnow_iso()}, ensure_ascii=False), flush=True)
+                return
             target_dt = next_decision_datetime(delay_seconds=int(self.config.decision_delay_seconds))
-            self._sleep_until_decision(target_dt=target_dt, dry_run=dry_run)
+            if self._sleep_until_decision(target_dt=target_dt, dry_run=dry_run, stop_file=stop_path):
+                print(json.dumps({"event": "shutdown", "reason": "stop_requested", "now_utc": _utcnow_iso()}, ensure_ascii=False), flush=True)
+                return
             try:
                 result = self.run_once(dry_run=dry_run)
                 print(json.dumps(_decision_log_payload(result), ensure_ascii=False, default=str), flush=True)
@@ -189,33 +198,41 @@ class BybitDemoRuntime:
                 reason, details = _runtime_error_reconciliation(exc)
                 self.state.set_reconciliation("blocked", reason, details)
                 print(json.dumps({"event": "runtime_error", "status": "blocked", "now_utc": _utcnow_iso(), **details}, ensure_ascii=False), flush=True)
-                time.sleep(max(int(self.config.loop_sleep_seconds), 1))
+                if _sleep_with_stop(max(int(self.config.loop_sleep_seconds), 1), stop_path):
+                    print(json.dumps({"event": "shutdown", "reason": "stop_requested", "now_utc": _utcnow_iso()}, ensure_ascii=False), flush=True)
+                    return
 
-    def _sleep_until_decision(self, *, target_dt: datetime, dry_run: bool) -> None:
+    def _sleep_until_decision(self, *, target_dt: datetime, dry_run: bool, stop_file: Path | None = None) -> bool:
         heartbeat = max(int(self.config.heartbeat_seconds), 1)
+        next_heartbeat = 0.0
         while True:
+            if _stop_requested(stop_file):
+                return True
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             remaining = (target_dt - now).total_seconds()
             if remaining <= 0:
-                return
-            active = self.state.load_active_episode()
-            print(
-                json.dumps(
-                    {
-                        "event": "heartbeat",
-                        "environment": self.config.environment,
-                        "dry_run": bool(dry_run),
-                        "now_utc": now.isoformat(timespec="seconds"),
-                        "next_decision_utc": target_dt.isoformat(timespec="seconds"),
-                        "seconds_until_next_decision": int(max(remaining, 0)),
-                        "active_symbol": active.get("symbol") if active else None,
-                        "active_side": active.get("side") if active else None,
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
-            time.sleep(min(remaining, heartbeat))
+                return False
+            monotonic_now = time.monotonic()
+            if monotonic_now >= next_heartbeat:
+                active = self.state.load_active_episode()
+                print(
+                    json.dumps(
+                        {
+                            "event": "heartbeat",
+                            "environment": self.config.environment,
+                            "dry_run": bool(dry_run),
+                            "now_utc": now.isoformat(timespec="seconds"),
+                            "next_decision_utc": target_dt.isoformat(timespec="seconds"),
+                            "seconds_until_next_decision": int(max(remaining, 0)),
+                            "active_symbol": active.get("symbol") if active else None,
+                            "active_side": active.get("side") if active else None,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                next_heartbeat = monotonic_now + heartbeat
+            time.sleep(min(remaining, heartbeat, 1.0 if stop_file else heartbeat))
 
     def status(self) -> dict[str, Any]:
         return self.state.status()
@@ -423,7 +440,7 @@ class BybitDemoRuntime:
         dry_run: bool,
     ) -> list[dict[str, Any]]:
         symbol = str(active.get("symbol"))
-        final_side = str(selected.get("final_side") or active.get("side"))
+        final_side = str(active.get("side") or selected.get("final_side"))
         events: list[dict[str, Any]] = []
         for sleeve in self._trade_sleeves():
             client = self.sleeve_clients[sleeve.sleeve_id]
@@ -891,6 +908,19 @@ def _decision_log_payload(result: Mapping[str, Any]) -> dict[str, Any]:
 def _payload_blocks_reconciliation(payload: Mapping[str, Any]) -> bool:
     rebalance = payload.get("rebalance")
     return payload.get("action") == "blocked" or (isinstance(rebalance, Mapping) and rebalance.get("status") == "blocked")
+
+
+def _stop_requested(stop_file: Path | None) -> bool:
+    return bool(stop_file and stop_file.exists())
+
+
+def _sleep_with_stop(seconds: float, stop_file: Path | None) -> bool:
+    deadline = time.monotonic() + max(float(seconds), 0.0)
+    while time.monotonic() < deadline:
+        if _stop_requested(stop_file):
+            return True
+        time.sleep(min(deadline - time.monotonic(), 1.0 if stop_file else max(float(seconds), 0.0)))
+    return _stop_requested(stop_file)
 
 
 def _runtime_error_reconciliation(exc: Exception) -> tuple[str, dict[str, Any]]:

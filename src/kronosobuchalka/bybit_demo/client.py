@@ -262,6 +262,48 @@ class BybitV5Client:
     def positions(self, *, category: str, symbol: str) -> Mapping[str, Any]:
         return self.private_get("/v5/position/list", {"category": category, "symbol": symbol})
 
+    def closed_pnl(
+        self,
+        *,
+        category: str,
+        symbol: str | None = None,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> Mapping[str, Any]:
+        params: dict[str, Any] = {"category": category, "limit": int(limit)}
+        if symbol:
+            params["symbol"] = symbol
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        if cursor:
+            params["cursor"] = cursor
+        return self.private_get("/v5/position/closed-pnl", params)
+
+    def executions(
+        self,
+        *,
+        category: str,
+        symbol: str | None = None,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> Mapping[str, Any]:
+        params: dict[str, Any] = {"category": category, "limit": int(limit)}
+        if symbol:
+            params["symbol"] = symbol
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        if cursor:
+            params["cursor"] = cursor
+        return self.private_get("/v5/execution/list", params)
+
     def set_leverage(
         self,
         *,

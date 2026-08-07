@@ -217,6 +217,47 @@ class BybitClientTests(unittest.TestCase):
 
         self.assertEqual(session.body["orderLinkId"], "krn-test")
 
+    def test_closed_pnl_sends_expected_query_params(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.url = ""
+
+            def get(self, url: str, *, headers: Mapping[str, str], timeout: float) -> FakeResponse:
+                self.url = url
+                return FakeResponse({"retCode": 0, "retMsg": "OK", "result": {"list": []}})
+
+        session = FakeSession()
+        client = BybitV5Client(credentials=BybitCredentials("key", "secret"), session=session)  # type: ignore[arg-type]
+        client.closed_pnl(category="linear", symbol="BTCUSDT", start_time_ms=1, end_time_ms=2, limit=25)
+
+        self.assertIn("/v5/position/closed-pnl", session.url)
+        self.assertIn("category=linear", session.url)
+        self.assertIn("symbol=BTCUSDT", session.url)
+        self.assertIn("startTime=1", session.url)
+        self.assertIn("endTime=2", session.url)
+        self.assertIn("limit=25", session.url)
+
+    def test_executions_sends_expected_query_params(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.url = ""
+
+            def get(self, url: str, *, headers: Mapping[str, str], timeout: float) -> FakeResponse:
+                self.url = url
+                return FakeResponse({"retCode": 0, "retMsg": "OK", "result": {"list": []}})
+
+        session = FakeSession()
+        client = BybitV5Client(credentials=BybitCredentials("key", "secret"), session=session)  # type: ignore[arg-type]
+        client.executions(category="linear", symbol="SOLUSDT", start_time_ms=10, end_time_ms=20, limit=30, cursor="abc")
+
+        self.assertIn("/v5/execution/list", session.url)
+        self.assertIn("category=linear", session.url)
+        self.assertIn("symbol=SOLUSDT", session.url)
+        self.assertIn("startTime=10", session.url)
+        self.assertIn("endTime=20", session.url)
+        self.assertIn("limit=30", session.url)
+        self.assertIn("cursor=abc", session.url)
+
 
 if __name__ == "__main__":
     unittest.main()

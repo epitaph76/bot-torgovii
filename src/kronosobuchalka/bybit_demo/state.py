@@ -146,6 +146,39 @@ class BotStateStore:
             else None,
         }
 
+    def latest_decisions(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "select decision_id, as_of, payload_json, created_at from decisions order by created_at desc limit ?",
+                (max(int(limit), 1),),
+            ).fetchall()
+        return [
+            {
+                "decision_id": row[0],
+                "as_of": row[1],
+                "payload": json.loads(row[2]),
+                "created_at": row[3],
+            }
+            for row in rows
+        ]
+
+    def latest_order_events(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "select decision_id, sleeve_id, action, payload_json, created_at from order_events order by id desc limit ?",
+                (max(int(limit), 1),),
+            ).fetchall()
+        return [
+            {
+                "decision_id": row[0],
+                "sleeve_id": row[1],
+                "action": row[2],
+                "payload": json.loads(row[3]),
+                "created_at": row[4],
+            }
+            for row in rows
+        ]
+
     def _init(self) -> None:
         with closing(self._connect()) as conn:
             with conn:

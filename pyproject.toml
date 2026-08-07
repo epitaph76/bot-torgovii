@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bot-torgovii"
 version = "0.1.0"
-description = "Autonomous Bybit Demo GRAM/ZEC Kronos trading bot."
+description = "Autonomous Bybit Demo Kronos Tigrinya trading bot."
 requires-python = ">=3.11"
 dependencies = [
   "einops>=0.8",
@@ -14,6 +14,7 @@ dependencies = [
   "pandas>=2.2",
   "requests>=2.31",
   "safetensors>=0.6",
+  "textual>=0.80",
   "torch>=2.0",
   "tqdm>=4.67",
 ]

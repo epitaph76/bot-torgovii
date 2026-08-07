@@ -12,7 +12,7 @@ import pandas as pd
 from ..binance_archive import KLINE_COLUMNS
 from ..kronos_labeler import KronosPaths, LabelConfig, _load_predictor, _predict_one
 from .client import quantize_down
-from .config import BybitDemoBotConfig, StrategyConfig
+from .config import BybitDemoBotConfig, StrategyConfig, SymbolStrategyFilter
 from .market import InstrumentSpec, MarketBundle
 
 
@@ -102,7 +102,15 @@ def build_strategy_decision(
         forecast = forecasts.get(symbol)
         if forecast is None:
             continue
-        rows.append(_build_feature_row(symbol=symbol, bundle=bundle, forecast=forecast, strategy=config.strategy))
+        rows.append(
+            _build_feature_row(
+                symbol=symbol,
+                bundle=bundle,
+                forecast=forecast,
+                strategy=config.strategy,
+                symbol_filter=config.strategy.filter_for(symbol),
+            )
+        )
     if not rows:
         return StrategyDecision(
             as_of=bundle.decision_as_of.isoformat(),
@@ -114,15 +122,10 @@ def build_strategy_decision(
         )
     frame = pd.DataFrame(rows).sort_values(["net_pred_move_pct", "secid"], ascending=[False, True]).reset_index(drop=True)
     frame["rank"] = np.arange(1, len(frame) + 1)
-    selected = None
-    status = "cash"
-    reason = "rank1_failed_entry_filter"
-    if not frame.empty:
-        top = frame.iloc[0].to_dict()
-        if bool(top.get("entry_selected")):
-            selected = top
-            status = "selected"
-            reason = "rank1_passed_entry_filter"
+    if config.strategy.ranking_mode == "rank_cascade":
+        selected, status, reason = _select_rank_cascade(frame)
+    else:
+        selected, status, reason = _select_rank1_only(frame)
     return StrategyDecision(
         as_of=bundle.decision_as_of.isoformat(),
         target_timestamp=bundle.target_timestamp.isoformat(),
@@ -144,20 +147,81 @@ def active_can_hold(
     expected_as_of = active.get("target_timestamp")
     if expected_as_of and pd.Timestamp(expected_as_of) != pd.Timestamp(decision.as_of):
         return False, "episode_time_gap"
-    selected = decision.selected
-    if not selected:
-        return False, "no_rank1_selection"
-    if str(selected.get("secid")) != str(active.get("symbol")):
-        return False, "rank1_symbol_changed"
-    if str(selected.get("final_side")) != str(active.get("side")):
-        return False, "rank1_side_changed"
-    net = _finite(selected.get("net_pred_move_bps"))
-    vol = _finite(selected.get("vol_ratio_168"))
-    if net < float(config.strategy.exit_net_pred_move_bps_min):
+    active_symbol = str(active.get("symbol"))
+    ranked_rows = _ranked_decision_rows(decision)
+    if not ranked_rows:
+        return False, "no_ranked_candidates"
+    if config.strategy.ranking_mode == "rank1_only":
+        return _active_can_hold_rank1_only(active_symbol=active_symbol, ranked_rows=ranked_rows, config=config)
+    active_row = None
+    for row in ranked_rows:
+        if str(row.get("secid")) == active_symbol:
+            active_row = row
+            break
+        if bool(row.get("entry_selected")):
+            return False, "higher_rank_entry_candidate_selected"
+    if active_row is None:
+        return False, "active_symbol_not_in_ranked_candidates"
+    if str(active_row.get("final_side")) != str(active.get("side")):
+        return False, "selected_side_changed"
+    symbol_filter = config.strategy.filter_for(active_symbol)
+    net = _finite(active_row.get("net_pred_move_bps"))
+    vol = _finite(active_row.get("vol_ratio_168"))
+    if net < float(symbol_filter.exit_net_pred_move_bps_min):
         return False, "hold_net_pred_move_bps_below_exit_threshold"
-    if not math.isfinite(vol) or vol < float(config.strategy.exit_vol_ratio_168_min):
+    if not math.isfinite(vol) or vol < float(symbol_filter.exit_vol_ratio_168_min):
         return False, "hold_vol_ratio_168_below_exit_threshold"
     return True, "hold_decay_passed"
+
+
+def _select_rank1_only(frame: pd.DataFrame) -> tuple[dict[str, Any] | None, str, str]:
+    rows = frame.to_dict(orient="records")
+    if not rows:
+        return None, "cash", "no_ranked_candidates"
+    rank1 = rows[0]
+    if bool(rank1.get("entry_selected")):
+        return rank1, "selected", "rank1_passed_entry_filter"
+    return None, "cash", "rank1_failed_entry_filter"
+
+
+def _select_rank_cascade(frame: pd.DataFrame) -> tuple[dict[str, Any] | None, str, str]:
+    for row in frame.to_dict(orient="records"):
+        if bool(row.get("entry_selected")):
+            return row, "selected", f"rank{int(row['rank'])}_passed_entry_filter"
+    return None, "cash", "no_ranked_candidate_passed_entry_filter"
+
+
+def _active_can_hold_rank1_only(
+    *,
+    active_symbol: str,
+    ranked_rows: list[dict[str, Any]],
+    config: BybitDemoBotConfig,
+) -> tuple[bool, str]:
+    active_row = None
+    for row in ranked_rows:
+        if str(row.get("secid")) == active_symbol:
+            active_row = row
+            break
+    if active_row is None:
+        return False, "active_symbol_not_in_ranked_candidates"
+    symbol_filter = config.strategy.filter_for(active_symbol)
+    net = _finite(active_row.get("net_pred_move_bps"))
+    vol = _finite(active_row.get("vol_ratio_168"))
+    if net < float(symbol_filter.exit_net_pred_move_bps_min):
+        return False, "hold_net_pred_move_bps_below_exit_threshold"
+    if not math.isfinite(vol) or vol < float(symbol_filter.exit_vol_ratio_168_min):
+        return False, "hold_vol_ratio_168_below_exit_threshold"
+    return True, "hold_decay_passed"
+
+
+def active_decision_row(*, active: Mapping[str, Any] | None, decision: StrategyDecision) -> dict[str, Any] | None:
+    if not active:
+        return None
+    active_symbol = str(active.get("symbol"))
+    for row in _ranked_decision_rows(decision):
+        if str(row.get("secid")) == active_symbol:
+            return row
+    return None
 
 
 def stop_price(*, side: str, entry_price: Decimal, stop_loss_pct: float, spec: InstrumentSpec) -> Decimal:
@@ -199,6 +263,7 @@ def _build_feature_row(
     bundle: MarketBundle,
     forecast: ForecastRow,
     strategy: StrategyConfig,
+    symbol_filter: SymbolStrategyFilter,
 ) -> dict[str, Any]:
     history = bundle.candles[symbol].copy()
     for column in KLINE_COLUMNS:
@@ -215,23 +280,32 @@ def _build_feature_row(
     pred_side = "long" if pred_direction > 0 else "short"
 
     cost = _live_execution_cost(history, strategy)
-    vol = float(actual_body_return.tail(168).std(ddof=0)) if len(actual_body_return.dropna()) >= _auto_min_periods(168) else math.nan
-    vol_ratio = pred_abs_move_pct / vol if math.isfinite(vol) and vol > 1e-12 else math.nan
+    vol_168 = _tail_std(actual_body_return, 168, _auto_min_periods(168))
+    vol_ratio_168 = pred_abs_move_pct / vol_168 if math.isfinite(vol_168) and vol_168 > 1e-12 else math.nan
+    entry_vol_lookback = max(int(symbol_filter.entry_vol_ratio_lookback_hours), 1)
+    entry_vol = _tail_std(actual_body_return, entry_vol_lookback, _auto_min_periods(entry_vol_lookback))
+    entry_vol_ratio = pred_abs_move_pct / entry_vol if math.isfinite(entry_vol) and entry_vol > 1e-12 else math.nan
 
     hl = _live_hl_metrics(history, forecast, forming_open, pred_direction)
     is_extreme = (
-        _finite(hl["hl_relevant_wick_ratio_168"]) >= float(strategy.hl_relevant_wick_ratio_168_min)
-        and _finite(hl["hl_range_ratio_168"]) >= float(strategy.hl_range_ratio_168_min)
+        bool(symbol_filter.flip_enabled)
+        and _finite(hl["hl_relevant_wick_ratio_168"]) >= float(symbol_filter.hl_relevant_wick_ratio_168_min)
+        and _finite(hl["hl_range_ratio_168"]) >= float(symbol_filter.hl_range_ratio_168_min)
+        and _finite(hl["pred_relevant_wick_bps"]) >= float(symbol_filter.pred_relevant_wick_bps_min)
+        and _finite(hl["pred_range_bps"]) >= float(symbol_filter.pred_range_bps_min)
     )
     final_direction = -pred_direction if is_extreme else pred_direction
     final_side = "long" if final_direction > 0 else "short"
     net_pred_move_pct = pred_abs_move_pct - cost["execution_cost_pct"]
     net_pred_move_bps = net_pred_move_pct * 10_000.0
+    execution_cost_bps = cost["execution_cost_pct"] * 10_000.0
+    cost_cap = symbol_filter.entry_execution_cost_bps_max
     entry_selected = bool(
-        math.isfinite(vol_ratio)
-        and vol_ratio >= float(strategy.entry_vol_ratio_168_min)
+        math.isfinite(entry_vol_ratio)
+        and entry_vol_ratio >= float(symbol_filter.entry_vol_ratio_min)
         and math.isfinite(net_pred_move_bps)
-        and net_pred_move_bps >= float(strategy.entry_net_pred_move_bps_min)
+        and net_pred_move_bps >= float(symbol_filter.entry_net_pred_move_bps_min)
+        and (cost_cap is None or (math.isfinite(execution_cost_bps) and execution_cost_bps <= float(cost_cap)))
     )
     return {
         "secid": symbol,
@@ -245,7 +319,7 @@ def _build_feature_row(
         "pred_direction": pred_direction,
         "pred_side": pred_side,
         "execution_cost_pct": cost["execution_cost_pct"],
-        "execution_cost_bps": cost["execution_cost_pct"] * 10_000.0,
+        "execution_cost_bps": execution_cost_bps,
         "estimated_spread_pct": cost["estimated_spread_pct"],
         "liquidity_penalty": cost["liquidity_penalty"],
         "slippage_one_way_pct": cost["slippage_one_way_pct"],
@@ -253,8 +327,21 @@ def _build_feature_row(
         "range_spread_fallback_pct": cost["range_spread_fallback_pct"],
         "net_pred_move_pct": net_pred_move_pct,
         "net_pred_move_bps": net_pred_move_bps,
-        "rolling_vol_168_pct": vol,
-        "vol_ratio_168": vol_ratio,
+        "rolling_vol_168_pct": vol_168,
+        "vol_ratio_168": vol_ratio_168,
+        "entry_vol_lookback_hours": entry_vol_lookback,
+        "rolling_vol_entry_pct": entry_vol,
+        "entry_vol_ratio": entry_vol_ratio,
+        "entry_vol_ratio_min": float(symbol_filter.entry_vol_ratio_min),
+        "entry_net_pred_move_bps_min": float(symbol_filter.entry_net_pred_move_bps_min),
+        "entry_execution_cost_bps_max": cost_cap,
+        "exit_net_pred_move_bps_min": float(symbol_filter.exit_net_pred_move_bps_min),
+        "exit_vol_ratio_168_min": float(symbol_filter.exit_vol_ratio_168_min),
+        "flip_enabled": bool(symbol_filter.flip_enabled),
+        "flip_hl_relevant_wick_ratio_168_min": float(symbol_filter.hl_relevant_wick_ratio_168_min),
+        "flip_hl_range_ratio_168_min": float(symbol_filter.hl_range_ratio_168_min),
+        "flip_pred_relevant_wick_bps_min": float(symbol_filter.pred_relevant_wick_bps_min),
+        "flip_pred_range_bps_min": float(symbol_filter.pred_range_bps_min),
         **hl,
         "is_extreme": is_extreme,
         "flip_applied": is_extreme,
@@ -371,6 +458,13 @@ def _tail_mean(series: pd.Series, lookback: int, min_periods: int) -> float:
     return float(clean.mean())
 
 
+def _tail_std(series: pd.Series, lookback: int, min_periods: int) -> float:
+    clean = pd.to_numeric(series, errors="coerce").dropna().tail(int(lookback))
+    if len(clean) < int(min_periods):
+        return math.nan
+    return float(clean.std(ddof=0))
+
+
 def _auto_min_periods(lookback: int) -> int:
     return min(int(lookback), max(6, int(lookback) // 3))
 
@@ -385,6 +479,14 @@ def _finite(value: Any) -> float:
 
 def _json_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return [_json_row(row) for row in frame.to_dict(orient="records")]
+
+
+def _ranked_decision_rows(decision: StrategyDecision) -> list[dict[str, Any]]:
+    rows = list(getattr(decision, "ranked_rows", []) or [])
+    selected = getattr(decision, "selected", None)
+    if not rows and selected:
+        rows = [selected]
+    return sorted(rows, key=lambda row: int(row.get("rank") or 10**9))
 
 
 def _json_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:

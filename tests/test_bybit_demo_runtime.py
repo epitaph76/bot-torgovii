@@ -4,7 +4,9 @@ import sys
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from decimal import Decimal
+from io import StringIO
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -102,14 +104,12 @@ class DuplicateOpenClient(FakeClient):
 
 def bundle() -> MarketBundle:
     base = candles(price=100)
+    symbols = ("GRAMUSDT", "ZECUSDT", "BTCUSDT", "SOLUSDT")
     return MarketBundle(
-        candles={"GRAMUSDT": base, "ZECUSDT": base.copy()},
-        forming_open={"GRAMUSDT": Decimal("100"), "ZECUSDT": Decimal("100")},
-        tickers={
-            "GRAMUSDT": Ticker("GRAMUSDT", Decimal("100"), Decimal("99.9"), Decimal("100.1")),
-            "ZECUSDT": Ticker("ZECUSDT", Decimal("100"), Decimal("99.9"), Decimal("100.1")),
-        },
-        specs={"GRAMUSDT": spec("GRAMUSDT"), "ZECUSDT": spec("ZECUSDT")},
+        candles={symbol: base.copy() for symbol in symbols},
+        forming_open={symbol: Decimal("100") for symbol in symbols},
+        tickers={symbol: Ticker(symbol, Decimal("100"), Decimal("99.9"), Decimal("100.1")) for symbol in symbols},
+        specs={symbol: spec(symbol) for symbol in symbols},
         decision_as_of=pd.Timestamp("2026-07-10 00:00:00"),
         target_timestamp=pd.Timestamp("2026-07-10 01:00:00"),
     )
@@ -134,10 +134,19 @@ def probe_config(tmp: str) -> BybitDemoBotConfig:
                 ]
             },
             "strategy": {
-                "entry_vol_ratio_168_min": 0.0,
-                "entry_net_pred_move_bps_min": -10000,
-                "exit_net_pred_move_bps_min": -10000,
-                "exit_vol_ratio_168_min": 0.0,
+                "symbols": ["GRAMUSDT", "ZECUSDT"],
+                "symbol_filters": {
+                    "GRAMUSDT": {
+                        "entry": {"net_pred_move_bps_min": -10000, "vol_ratio_min": 0.0},
+                        "hold": {"net_pred_move_bps_min": -10000, "vol_ratio_168_min": 0.0},
+                        "flip": {"enabled": False},
+                    },
+                    "ZECUSDT": {
+                        "entry": {"net_pred_move_bps_min": -10000, "vol_ratio_min": 0.0},
+                        "hold": {"net_pred_move_bps_min": -10000, "vol_ratio_168_min": 0.0},
+                        "flip": {"enabled": False},
+                    },
+                },
             },
         }
     )
@@ -340,11 +349,11 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(len(stop_calls), 1)
             self.assertEqual(result["orders"][0]["action"], "refresh_stop")
 
-    def test_side_or_symbol_change_closes_then_opens_in_dry_run(self) -> None:
+    def test_rank1_only_active_hold_refreshes_active_side_when_rank1_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = probe_config(tmp)
             forecasts = {
-                "GRAMUSDT": ForecastRow("GRAMUSDT", 100, 100.1, 99.9, 99.9, 0, 0),
+                "GRAMUSDT": ForecastRow("GRAMUSDT", 100, 100.1, 99.9, 99.7, 0, 0),
                 "ZECUSDT": ForecastRow("ZECUSDT", 100, 100.1, 99.9, 100.4, 0, 0),
             }
             state = BotStateStore(cfg.state_path)
@@ -369,9 +378,27 @@ class RuntimeTests(unittest.TestCase):
 
             result = runtime.run_once(dry_run=True)
 
-            self.assertEqual(result["action"], "close_then_open")
-            self.assertEqual([event["action"] for event in result["orders"]], ["close", "open"])
-            self.assertEqual(result["orders"][1]["symbol"], "ZECUSDT")
+            self.assertEqual(result["action"], "hold")
+            self.assertEqual([event["action"] for event in result["orders"]], ["refresh_stop"])
+            self.assertEqual(result["orders"][0]["symbol"], "GRAMUSDT")
+            self.assertEqual(result["orders"][0]["final_side"], "short")
+            active = state.load_active_episode()
+            self.assertEqual(active["last_decision"]["secid"], "GRAMUSDT")  # type: ignore[index]
+
+    def test_run_forever_returns_when_stop_file_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = probe_config(tmp)
+            stop_file = Path(tmp) / "stop.request"
+            stop_file.write_text("stop\n", encoding="utf-8")
+            runtime = BybitDemoRuntime(
+                config=cfg,
+                market=FakeMarket(bundle()),
+                forecaster=FakeForecaster({}),
+                state=BotStateStore(cfg.state_path),
+            )
+
+            with redirect_stdout(StringIO()):
+                runtime.run_forever(dry_run=True, stop_file=stop_file)
 
 
 if __name__ == "__main__":
